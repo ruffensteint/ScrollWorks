@@ -1,4 +1,4 @@
-# Ruffensteint ScrollWorks
+# ScrollWorks
 
 A browser-based carving design tool built with TypeScript, React and SVG. Generate scrollwork from editable backbones, compose chip-carving patterns, place leaf shapes, save local presets and export designs at physical millimeter sizes. Generation runs locally without AI API calls.
 
@@ -32,3 +32,4 @@ Leaf anatomy and collision handling remain works in progress. Review joins, over
 The public snapshot is prepared with `node scripts/prepare-source-release.mjs`. It excludes private hosting metadata, existing Git history, references and personal designs. See RELEASE_AUDIT.md for the review record.
 
 The GitHub source release is a browser-only edition: it has no app-install button, PWA manifest, or offline service worker.
+

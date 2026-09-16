@@ -351,8 +351,8 @@ export default function App() {
     <main className="app-shell">
       <aside className="controls">
         <div className="brand">
-          <span className="eyebrow">Carve Design</span>
-          <h1>Scroll Laboratory</h1>
+          <span className="eyebrow">ScrollWorks</span>
+          <h1>ScrollWorks</h1>
           <p>Build the flow first. Ornament comes later.</p>
         </div>
 
