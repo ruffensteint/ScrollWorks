@@ -1,0 +1,7 @@
+import {it,expect} from 'vitest';
+import {generateGrowth,defaultGrowth} from './growth';
+import {initialLayout,parseLayout,replaceBackbone} from './model';
+import {intersection} from './outlineUnion';
+it('keeps supporting silhouettes free of self crossings',()=>{for(const seed of [1248,1249])for(const part of generateGrowth(initialLayout(),{...defaultGrowth,composition:2,seed}).parts.filter(p=>p.parent!==null)){const p=part.polygon;for(let i=0;i<p.length;i++)for(let j=i+2;j<p.length;j++){if(i===0&&j===p.length-1)continue;const hit=intersection(p[i],p[(i+1)%p.length],p[j],p[(j+1)%p.length]);expect(hit===null||hit<1e-5||hit>1-1e-5).toBe(true);}}});
+it('composes repeatable variations with useful supporting growth',()=>{const d=initialLayout(),s={...defaultGrowth,composition:2 as const};const a=generateGrowth(d,s),b=generateGrowth(d,{...s,seed:s.seed+1});expect(a.parts.length).toBeGreaterThan(1);expect(a).toEqual(generateGrowth(d,s));expect(a.parts[0]).toEqual(b.parts[0]);expect(a.parts.slice(1)).not.toEqual(b.parts.slice(1));});
+it('preserves locked geometry through variations and serialization',()=>{const d=initialLayout();d.growth={...defaultGrowth,composition:2};const first=generateGrowth(d,d.growth);d.lockedParts=[first.parts[1]];const saved=parseLayout(JSON.stringify(d));const next=generateGrowth(saved,{...d.growth,seed:555});expect(next.parts.find(p=>p.id===d.lockedParts![0].id)).toEqual(d.lockedParts[0]);expect(replaceBackbone(d,0,d.curve).lockedParts).toBeUndefined();});

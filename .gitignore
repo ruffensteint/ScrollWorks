@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+.env*
+*.local
+references/
+layouts/
+.openai/
+release-source/

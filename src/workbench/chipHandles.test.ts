@@ -1,0 +1,6 @@
+import {it,expect} from 'vitest';
+import {chipHandles,moveChipHandle} from './chipHandles';
+import {chipRegions,defaultChip,validChip,parseChip} from './chip';
+it('shows exactly three handles on both open-side and whole-lens chips',()=>{for(const borderSeed of [0,2])for(const p of chipRegions({...defaultChip,borderSeed}).filter(p=>p.length>10)){expect(chipHandles(p).map(h=>h.label)).toEqual(['Start','Middle','End']);}});
+it('bends intermediate samples while preserving the other two handles',()=>{const p=chipRegions(defaultChip).find(p=>p.length===21)!;for(const index of [0,10,20]){const target={x:p[index].x+.2,y:p[index].y+.2},q=moveChipHandle(p,index,target);expect(q[index]).toEqual(target);for(const j of [0,10,20].filter(j=>j!==index))expect(q[j]).toEqual(p[j]);expect(q[5]).not.toEqual(p[5]);expect(q).toHaveLength(p.length);}});
+it('moves closed lenses without separating duplicate endpoints and saves samples',()=>{const s={...defaultChip,borderSeed:2},all=chipRegions(s),id=all.findIndex(p=>p.length===42),p=all[id],q=moveChipHandle(p,10,{x:p[10].x+.05,y:p[10].y+.05});expect(q[0]).toEqual(q[41]);expect(q[20]).toEqual(q[21]);expect(validChip(q)).toBe(true);expect(chipRegions(parseChip(JSON.stringify({...s,edits:{[id]:q}})))[id]).toEqual(q);});
