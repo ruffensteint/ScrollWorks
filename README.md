@@ -1,4 +1,4 @@
-# Ruffensteint Carving Studio
+# Ruffensteint ScrollWorks
 
 A browser-based carving design tool built with TypeScript, React and SVG. Generate scrollwork from editable backbones, compose chip-carving patterns, place leaf shapes, save local presets and export designs at physical millimeter sizes. Generation runs locally without AI API calls.
 
