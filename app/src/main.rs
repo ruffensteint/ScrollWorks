@@ -1,0 +1,1057 @@
+//! ScrollWorks — native desktop app. Procedural acanthus scroll patterns for
+//! carving, drawn with egui (no web engine). Geometry lives in `scroll_core`.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod chip_ui;
+mod io;
+mod presets;
+mod theme;
+
+use eframe::egui::{self, Color32, Pos2, Rect, Sense, Shape, Stroke, Vec2};
+use scroll_core::geometry::{fit_curve, pt, Bounds, Curve, Point};
+use scroll_core::growth::{Family, GrowthPart, GrowthResult, GrowthSettings, Side};
+use scroll_core::layers::{carving_guides, layered_drawing, Drawing, Guides};
+use scroll_core::bud::{is_bud, BUD_PRESETS};
+use scroll_core::model::{convert_legacy, preset_params, Layout, LEAF_PRESETS};
+use scroll_core::skeleton::{skeleton_layout, Skeleton};
+use scroll_core::outline::inside;
+use scroll_core::profiles::profile;
+use scroll_core::shoots::{drag_tip, nearest_progress, tip_handle, ShootEdit, ShootParams};
+use scroll_core::transform::{flip_curve, mirror_shoot, transform_curve, Axis, TransformKind};
+use std::path::PathBuf;
+use theme::{Canvas, Prefs, Theme, ThemeId};
+
+fn main() -> eframe::Result<()> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_inner_size([1440.0, 900.0]).with_min_inner_size([900.0, 600.0]).with_title("ScrollWorks"),
+        ..Default::default()
+    };
+    eframe::run_native("ScrollWorks", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tool { Select, Pen, Transform }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Workspace { Scroll, Chip }
+#[derive(Clone, Copy, PartialEq)]
+enum Pending { New, Open, Close }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab { Properties, Leaves, Layers, Carving, Theme }
+
+enum Drag {
+    Pan,
+    Handle { index: usize },
+    ShootRoot { edit: String, backbone: usize },
+    ShootTip { edit: String, start: ShootParams, root: Point, handle: Point },
+    /// A backbone and everything that grows from it move together.
+    Transform { kind: TransformKind, center: Point, from: Point, curves: Vec<(usize, Curve)> },
+    Draw { points: Vec<Point> },
+}
+
+struct App {
+    layout: Layout,
+    path: Option<PathBuf>,
+    dirty: bool,
+    past: Vec<Layout>,
+    future: Vec<Layout>,
+    tool: Tool,
+    tab: Tab,
+    backbone: usize,
+    selected: Option<String>,
+    carving: bool,
+    show_guides: bool,
+    grid: bool,
+    // cached growth and drawings
+    grown: GrowthResult,
+    drawing: Drawing,
+    guides: Option<Guides>,
+    stale: bool,
+    // view: screen = origin + mm * zoom
+    zoom: f32,
+    origin: Pos2,
+    fitted: bool,
+    drag: Option<Drag>,
+    drag_before: Option<Layout>,
+    message: String,
+    cursor_mm: Option<Point>,
+    shown_title: String,
+    /// An action that would discard unsaved work, and whether it is cleared to run.
+    pending: Option<(Pending, bool)>,
+    allow_close: bool,
+    prefs: Prefs,
+    /// Preferences last installed into egui.
+    applied: Option<Prefs>,
+    /// Interface size while its slider is being dragged.
+    scale_draft: f32,
+    workspace: Workspace,
+    chip: chip_ui::ChipState,
+    scroll_presets: presets::Library,
+    scroll_thumbs: Vec<Option<Vec<Vec<Point>>>>,
+    /// Last construction built, its variation, and cached card thumbnails.
+    skeleton: Option<Skeleton>,
+    skel_seed: u32,
+    skel_thumbs: Vec<Option<Vec<Vec<Point>>>>,
+}
+
+impl App {
+    fn new(cc: &eframe::CreationContext) -> Self {
+        theme::install_fonts(&cc.egui_ctx);
+        let prefs = Prefs::load();
+        let layout = Layout::starter();
+        let mut app = App { layout, path: None, dirty: false, past: vec![], future: vec![], tool: Tool::Select, tab: Tab::Properties, backbone: 0, selected: None, carving: false, show_guides: true, grid: false,
+            grown: GrowthResult::default(), drawing: Drawing { outline: vec![], folds: vec![] }, guides: None, stale: true, zoom: 3.0, origin: Pos2::ZERO, fitted: false, drag: None, drag_before: None, message: String::new(), cursor_mm: None, shown_title: String::new(), pending: None, allow_close: false, prefs, applied: None, scale_draft: prefs.ui_scale,
+            workspace: if prefs.chip { Workspace::Chip } else { Workspace::Scroll }, chip: chip_ui::ChipState::new(), scroll_presets: presets::Library::load("scroll-presets.json"), scroll_thumbs: vec![], skeleton: None, skel_seed: 0, skel_thumbs: vec![None; Skeleton::ALL.len()] };
+        app.regrow();
+        app
+    }
+
+    // ---------- model plumbing ----------
+    fn regrow(&mut self) {
+        let mut rounds = 0; while rounds < 6 && self.layout.settle() { rounds += 1; }
+        self.grown = self.layout.grow();
+        self.drawing = layered_drawing(&self.grown);
+        self.guides = if self.carving { Some(carving_guides(&self.grown)) } else { None };
+        self.stale = false;
+    }
+    /// Record an undo step, then change the layout.
+    fn commit(&mut self, next: Layout) {
+        self.past.push(self.layout.clone());
+        if self.past.len() > 100 { self.past.remove(0); }
+        self.future.clear();
+        self.layout = next;
+        self.dirty = true;
+        self.stale = true;
+    }
+    fn undo(&mut self) { if let Some(p) = self.past.pop() { self.future.push(std::mem::replace(&mut self.layout, p)); self.stale = true; self.dirty = true; self.clamp_backbone(); } }
+    fn redo(&mut self) { if let Some(n) = self.future.pop() { self.past.push(std::mem::replace(&mut self.layout, n)); self.stale = true; self.dirty = true; self.clamp_backbone(); } }
+    fn clamp_backbone(&mut self) { self.backbone = self.backbone.min(self.layout.curves.len() - 1); }
+    fn settings(&self) -> GrowthSettings { self.layout.growth_for(self.backbone) }
+    fn set_settings(&mut self, g: GrowthSettings) {
+        let mut next = self.layout.clone();
+        while next.growth.len() < next.curves.len() { let g0 = next.growth_for(next.growth.len()); next.growth.push(g0); }
+        next.growth[self.backbone] = g;
+        self.commit(next);
+    }
+    /// A hand-placed backbone keeps its proportions instead of refitting to
+    /// the page. Applied in place: the drag's undo state was already taken.
+    fn set_free(&mut self) {
+        while self.layout.growth.len() < self.layout.curves.len() { let g = self.layout.growth_for(self.layout.growth.len()); self.layout.growth.push(g); }
+        for b in self.group() { if self.layout.growth[b].free != Some(true) { self.layout.growth[b].free = Some(true); self.stale = true; } }
+    }
+    /// The selected backbone plus every backbone that grows from it.
+    fn group(&self) -> Vec<usize> { let mut g = vec![self.backbone]; g.extend(self.layout.descendants(self.backbone)); g }
+    fn t(&self) -> &'static Theme { self.prefs.theme.theme() }
+    fn canvas_colors(&self) -> Canvas { self.t().canvas(self.prefs.white_page) }
+    fn set_prefs(&mut self, p: Prefs) { if p != self.prefs { self.prefs = p; p.save(); } }
+    fn multi(&self) -> bool { self.layout.curves.len() > 1 }
+    /// (backbone, id without prefix) of a grown part id.
+    fn split_id(&self, id: &str) -> (usize, String) {
+        if let Some(rest) = id.strip_prefix("backbone-") { if let Some((n, local)) = rest.split_once('/') { return (n.parse().unwrap_or(0), local.to_string()); } }
+        (0, id.to_string())
+    }
+    fn display_id(&self, e: &ShootEdit) -> String { if self.multi() { format!("backbone-{}/{}", e.backbone, e.id) } else { e.id.clone() } }
+    fn selected_part(&self) -> Option<&GrowthPart> { let id = self.selected.as_ref()?; self.grown.parts.iter().find(|p| &p.id == id && p.parent.is_some() && p.shoot.is_some()) }
+    fn selected_edit(&self) -> Option<&ShootEdit> { let part = self.selected_part()?; let (b, local) = self.split_id(&part.id); self.layout.shoots.iter().find(|e| e.backbone == b && e.id == local) }
+    /// Generated shoots become edits the first time they are touched.
+    fn take_over(&self, layout: &mut Layout, part_id: &str) -> Option<String> {
+        let part = self.grown.parts.iter().find(|p| p.id == part_id)?;
+        let params = part.shoot.clone()?;
+        let (backbone, local) = self.split_id(part_id);
+        if layout.shoots.iter().any(|e| e.backbone == backbone && e.id == local) { return Some(local); }
+        let id = new_id();
+        layout.shoots.push(ShootEdit { params, id: id.clone(), backbone, replaces: Some(local), hidden: false, under: false });
+        Some(id)
+    }
+    fn patch_shoot(&mut self, f: impl FnOnce(&mut ShootEdit)) {
+        let Some(sel) = self.selected.clone() else { return };
+        let mut next = self.layout.clone();
+        let Some(id) = self.take_over(&mut next, &sel) else { return };
+        let (b, _) = self.split_id(&sel);
+        if let Some(e) = next.shoots.iter_mut().find(|e| e.id == id && e.backbone == b) { f(e); let d = self.display_id(e); self.commit(next); self.selected = Some(d); }
+    }
+    fn add_leaf(&mut self, id: &str) {
+        let at = self.selected_part().and_then(|p| p.shoot.as_ref()).map(|s| (s.progress + 0.12).min(0.95)).unwrap_or(0.5);
+        let side = if self.layout.shoots.len() % 2 == 1 { -1.0 } else { 1.0 };
+        let Some(params) = preset_params(id, at, side) else { return };
+        let mut next = self.layout.clone();
+        let e = ShootEdit { params, id: new_id(), backbone: self.backbone, replaces: None, hidden: false, under: false };
+        let d = self.display_id(&e);
+        next.shoots.push(e);
+        self.commit(next);
+        self.selected = Some(d);
+        self.tool = Tool::Select;
+        self.tab = Tab::Properties;
+    }
+    fn part_bounds(&self) -> Bounds {
+        let group = self.group();
+        let prefixes: Vec<String> = group.iter().map(|b| format!("backbone-{b}/")).collect();
+        let mut pts: Vec<Point> = self.grown.parts.iter().filter(|p| !self.multi() || prefixes.iter().any(|x| p.id.starts_with(x))).flat_map(|p| p.polygon.iter().copied()).collect();
+        for b in &group { pts.extend(self.layout.curves[*b]); }
+        Bounds::of(&pts)
+    }
+
+    // ---------- files ----------
+    fn title(&self) -> String {
+        let name = self.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "Untitled".into());
+        format!("{}{} — ScrollWorks", name, if self.dirty { " •" } else { "" })
+    }
+    fn new_file(&mut self) { self.commit(Layout::starter()); self.path = None; self.dirty = false; self.backbone = 0; self.selected = None; self.fitted = false; }
+    fn open(&mut self) {
+        let Some(path) = rfd::FileDialog::new().add_filter("ScrollWorks layout", &["scrollworks", "json"]).pick_file() else { return };
+        match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| io::parse(&t)) {
+            Ok(mut l) => {
+                let legacy = l.items.len();
+                if legacy > 0 { convert_legacy(&mut l, &mut new_id); }
+                self.commit(l); self.path = Some(path); self.dirty = false; self.backbone = 0; self.selected = None; self.fitted = false;
+                self.message = if legacy > 0 { format!("Opened. {legacy} stamped motif(s) from the old manual mode were converted to grown leaves.") } else { "Opened.".into() };
+            }
+            Err(e) => self.message = e,
+        }
+    }
+    /// Run an action that replaces the document, asking first if it has unsaved changes.
+    fn ask(&mut self, p: Pending) { self.pending = Some((p, !self.dirty)); }
+    fn run_pending(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
+            if self.dirty { ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose); self.pending = Some((Pending::Close, false)); }
+        }
+        let Some((p, cleared)) = self.pending else { return };
+        if cleared {
+            self.pending = None;
+            match p { Pending::New => self.new_file(), Pending::Open => self.open(), Pending::Close => { self.allow_close = true; ctx.send_viewport_cmd(egui::ViewportCommand::Close); } }
+            return;
+        }
+        let mut choice = None;
+        egui::Window::new("Unsaved changes").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO).show(ctx, |ui| {
+            ui.label("This pattern has changes that are not saved.");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() { choice = Some(0); }
+                if ui.button("Don't save").clicked() { choice = Some(1); }
+                if ui.button("Cancel").clicked() { choice = Some(2); }
+            });
+        });
+        match choice {
+            Some(0) => { self.save(false); if !self.dirty { self.pending = Some((p, true)); } }
+            Some(1) => self.pending = Some((p, true)),
+            Some(2) => self.pending = None,
+            _ => {}
+        }
+    }
+    fn save(&mut self, choose: bool) {
+        let path = if choose || self.path.is_none() {
+            match rfd::FileDialog::new().add_filter("ScrollWorks layout", &["scrollworks"]).set_file_name("pattern.scrollworks").save_file() { Some(p) => p, None => return }
+        } else { self.path.clone().unwrap() };
+        match std::fs::write(&path, io::save(&self.layout)) { Ok(()) => { self.path = Some(path); self.dirty = false; self.message = "Saved.".into(); } Err(e) => self.message = format!("Could not save: {e}") }
+    }
+    fn export(&mut self, carving: bool) {
+        let (name, svg) = if carving { ("carving-guides.svg", self.layout.carving_svg()) } else { ("pattern.svg", self.layout.svg()) };
+        if let Some(p) = rfd::FileDialog::new().add_filter("SVG", &["svg"]).set_file_name(name).save_file() {
+            match std::fs::write(&p, svg) { Ok(()) => self.message = format!("Exported {}.", p.display()), Err(e) => self.message = format!("Could not export: {e}") }
+        }
+    }
+
+    // ---------- view ----------
+    fn to_screen(&self, p: Point) -> Pos2 { Pos2::new(self.origin.x + p.x as f32 * self.zoom, self.origin.y + p.y as f32 * self.zoom) }
+    fn to_mm(&self, s: Pos2) -> Point { pt(((s.x - self.origin.x) / self.zoom) as f64, ((s.y - self.origin.y) / self.zoom) as f64) }
+    fn fit(&mut self, rect: Rect) {
+        let z = ((rect.width() - 60.0) / self.layout.width as f32).min((rect.height() - 60.0) / self.layout.height as f32).max(0.2);
+        self.zoom = z;
+        self.origin = Pos2::new(rect.center().x - self.layout.width as f32 * z / 2.0, rect.center().y - self.layout.height as f32 * z / 2.0);
+        self.fitted = true;
+    }
+}
+
+fn new_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+    let t = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
+    format!("edit-{:x}{:x}", t & 0xffffff, n)
+}
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Install the theme when it changes, and restore it if eframe resets
+        // the style (it follows the Windows light/dark setting).
+        if self.applied != Some(self.prefs) || ctx.style().visuals.panel_fill != self.t().bg {
+            self.t().apply(ctx);
+            ctx.set_zoom_factor(self.prefs.ui_scale);
+            self.applied = Some(self.prefs);
+        }
+        self.shortcuts(ctx);
+        self.run_pending(ctx);
+        if self.stale { self.regrow(); }
+        let title = if self.workspace == Workspace::Chip { self.chip.title() } else { self.title() };
+        if title != self.shown_title { ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone())); self.shown_title = title; }
+        self.menu_bar(ctx);
+        let desk = egui::Frame::none().fill(self.canvas_colors().desk);
+        if self.workspace == Workspace::Chip {
+            self.chip_status(ctx);
+            self.chip_side_panel(ctx);
+            egui::CentralPanel::default().frame(desk).show(ctx, |ui| self.chip_canvas(ui));
+        } else {
+            self.status_bar(ctx);
+            self.tool_strip(ctx);
+            self.side_panel(ctx);
+            egui::CentralPanel::default().frame(desk).show(ctx, |ui| self.canvas(ui));
+        }
+    }
+}
+
+impl App {
+    fn shortcuts(&mut self, ctx: &egui::Context) {
+        use egui::{Key, Modifiers};
+        let typing = ctx.wants_keyboard_input();
+        let (undo, redo, redo2, save, save_as, open, new) = ctx.input_mut(|i| (
+            i.consume_key(Modifiers::COMMAND, Key::Z), i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z), i.consume_key(Modifiers::COMMAND, Key::Y),
+            i.consume_key(Modifiers::COMMAND, Key::S), i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::S), i.consume_key(Modifiers::COMMAND, Key::O), i.consume_key(Modifiers::COMMAND, Key::N)));
+        if self.workspace == Workspace::Chip {
+            if undo { self.chip.undo(); }
+            if redo || redo2 { self.chip.redo(); }
+            if save_as { self.chip.save(true); } else if save { self.chip.save(false); }
+            if open { self.chip.open(); }
+            if new { self.chip.new_pattern(); }
+            if typing { return; }
+            let (del, esc) = ctx.input(|i| (i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace), i.key_pressed(Key::Escape)));
+            if del { self.chip.remove_selected(); }
+            if esc { self.chip.selected = None; }
+            return;
+        }
+        if undo { self.undo(); }
+        if redo || redo2 { self.redo(); }
+        if save_as { self.save(true); } else if save { self.save(false); }
+        if open { self.ask(Pending::Open); }
+        if new { self.ask(Pending::New); }
+        if typing { return; }
+        let (v, p, t, del, esc) = ctx.input(|i| (i.key_pressed(Key::V), i.key_pressed(Key::P), i.key_pressed(Key::T), i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace), i.key_pressed(Key::Escape)));
+        if v { self.tool = Tool::Select; }
+        if p { self.tool = Tool::Pen; }
+        if t { self.tool = Tool::Transform; self.selected = None; }
+        if esc { self.selected = None; self.tool = Tool::Select; }
+        if del && self.selected_part().is_some() { self.remove_selected(); }
+    }
+    fn remove_selected(&mut self) {
+        let Some(sel) = self.selected.clone() else { return };
+        let mut next = self.layout.clone();
+        let Some(id) = self.take_over(&mut next, &sel) else { return };
+        if let Some(i) = next.shoots.iter().position(|e| e.id == id) { if next.shoots[i].replaces.is_some() { next.shoots[i].hidden = true; } else { next.shoots.remove(i); } }
+        self.commit(next); self.selected = None;
+    }
+
+    fn menu_bar(&mut self, ctx: &egui::Context) {
+        let t = self.t();
+        egui::TopBottomPanel::top("menu").frame(egui::Frame::none().fill(t.bg).inner_margin(egui::Margin::symmetric(12.0, 6.0))).show(ctx, |ui| {
+            egui::menu::bar(ui, |ui| {
+                ui.label(egui::RichText::new("ScrollWorks").family(egui::FontFamily::Name("semibold".into())).size(15.0).color(t.text));
+                ui.add_space(10.0);
+                if self.workspace == Workspace::Chip { self.chip_menus(ui); } else {
+                ui.menu_button("File", |ui| {
+                    if ui.add(egui::Button::new("New").shortcut_text("Ctrl+N")).clicked() { self.ask(Pending::New); ui.close_menu(); }
+                    if ui.add(egui::Button::new("Open…").shortcut_text("Ctrl+O")).clicked() { ui.close_menu(); self.ask(Pending::Open); }
+                    if ui.add(egui::Button::new("Save").shortcut_text("Ctrl+S")).clicked() { ui.close_menu(); self.save(false); }
+                    if ui.add(egui::Button::new("Save As…").shortcut_text("Ctrl+Shift+S")).clicked() { ui.close_menu(); self.save(true); }
+                    ui.separator();
+                    if ui.button("Export pattern SVG…").clicked() { ui.close_menu(); self.export(false); }
+                    if ui.button("Export carving guides SVG…").clicked() { ui.close_menu(); self.export(true); }
+                });
+                ui.menu_button("Edit", |ui| {
+                    if ui.add_enabled(!self.past.is_empty(), egui::Button::new("Undo").shortcut_text("Ctrl+Z")).clicked() { self.undo(); ui.close_menu(); }
+                    if ui.add_enabled(!self.future.is_empty(), egui::Button::new("Redo").shortcut_text("Ctrl+Y")).clicked() { self.redo(); ui.close_menu(); }
+                    ui.separator();
+                    if ui.add_enabled(self.selected_part().is_some(), egui::Button::new("Delete leaf").shortcut_text("Del")).clicked() { self.remove_selected(); ui.close_menu(); }
+                    if ui.add_enabled(!self.layout.shoots.is_empty(), egui::Button::new("Clear all leaf edits")).clicked() { let mut n = self.layout.clone(); n.shoots.clear(); self.commit(n); self.selected = None; ui.close_menu(); }
+                });
+                ui.menu_button("View", |ui| {
+                    if ui.button("Fit page").clicked() { self.fitted = false; ui.close_menu(); }
+                    ui.checkbox(&mut self.show_guides, "Backbone guides");
+                    ui.checkbox(&mut self.grid, "Millimetre grid");
+                    if ui.checkbox(&mut self.carving, "Carving guides").changed() { self.stale = true; }
+                    ui.separator();
+                    ui.menu_button("Theme", |ui| {
+                        for id in ThemeId::ALL { if ui.selectable_label(self.prefs.theme == id, id.theme().name).clicked() { self.set_prefs(Prefs { theme: id, ..self.prefs }); ui.close_menu(); } }
+                    });
+                });
+                }
+                ui.add_space(16.0);
+                let mut ws = self.workspace;
+                ui.allocate_ui(Vec2::new(170.0, 28.0), |ui| segmented(ui, t, &[(Workspace::Scroll, "Scroll"), (Workspace::Chip, "Chip")], &mut ws));
+                if ws != self.workspace { self.workspace = ws; self.set_prefs(Prefs { chip: ws == Workspace::Chip, ..self.prefs }); }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { ui.label(egui::RichText::new("Runs offline · no AI").small().color(t.dim)); });
+            });
+        });
+    }
+
+    fn status_bar(&mut self, ctx: &egui::Context) {
+        let t = self.t();
+        egui::TopBottomPanel::bottom("status").frame(egui::Frame::none().fill(t.bg).inner_margin(egui::Margin::symmetric(14.0, 5.0))).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.visuals_mut().override_text_color = Some(t.dim);
+                ui.style_mut().override_text_style = Some(egui::TextStyle::Small);
+                ui.label(format!("{} × {} mm", self.layout.width, self.layout.height));
+                ui.separator();
+                ui.label(format!("{:.0}%", self.zoom / 3.78 * 100.0));
+                ui.separator();
+                if let Some(c) = self.cursor_mm { ui.label(format!("x {:.1}  y {:.1} mm", c.x, c.y)); }
+                ui.separator();
+                ui.label(if self.message.is_empty() { self.grown.message.clone() } else { self.message.clone() });
+            });
+        });
+    }
+
+    fn tool_strip(&mut self, ctx: &egui::Context) {
+        let t = self.t();
+        egui::SidePanel::left("tools").exact_width(56.0).resizable(false).frame(egui::Frame::none().fill(t.bg).inner_margin(egui::Margin::symmetric(8.0, 10.0))).show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.spacing_mut().item_spacing.y = 6.0;
+                let tools: [(Tool, &str, fn(&egui::Painter, Rect, Color32)); 3] = [
+                    (Tool::Select, "Select  (V)\nDrag leaves and backbone handles", icon_select),
+                    (Tool::Pen, "Draw backbone  (P)\nSketch a sweep to add a new backbone", icon_pen),
+                    (Tool::Transform, "Transform  (T)\nMove, scale, rotate or flip a backbone with its leaves", icon_transform)];
+                for (tool, tip, icon) in tools {
+                    if tool_button(ui, t, self.tool == tool, tip, icon) { self.tool = tool; if tool == Tool::Transform { self.selected = None; } }
+                }
+                ui.add_space(4.0);
+                let (line, _) = ui.allocate_exact_size(Vec2::new(24.0, 1.0), Sense::hover());
+                ui.painter().rect_filled(line, 0.0, t.border);
+                ui.add_space(4.0);
+                if tool_button(ui, t, self.tab == Tab::Leaves, "Leaf library\nAdd a measured leaf to the backbone", icon_leaf) { self.tab = Tab::Leaves; }
+            });
+        });
+    }
+
+    fn side_panel(&mut self, ctx: &egui::Context) {
+        let t = self.t();
+        egui::SidePanel::right("panel").default_width(340.0).min_width(300.0).frame(egui::Frame::none().fill(t.bg).inner_margin(egui::Margin { left: 16.0, right: 12.0, top: 12.0, bottom: 8.0 })).show(ctx, |ui| {
+            let mut tab = self.tab;
+            segmented(ui, t, &[(Tab::Properties, "Design"), (Tab::Leaves, "Library"), (Tab::Layers, "Layers"), (Tab::Carving, "Carve"), (Tab::Theme, "Theme")], &mut tab);
+            self.tab = tab;
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                ui.set_width(ui.available_width() - 4.0);
+                match self.tab {
+                    Tab::Properties => self.properties(ui),
+                    Tab::Leaves => self.leaves(ui),
+                    Tab::Layers => self.layers(ui),
+                    Tab::Carving => self.carving_tab(ui),
+                    Tab::Theme => self.theme_tab(ui),
+                }
+                ui.add_space(12.0);
+            });
+        });
+    }
+
+    fn properties(&mut self, ui: &mut egui::Ui) {
+        if self.selected_part().is_some() { self.shoot_properties(ui); }
+        else if self.tool != Tool::Transform { self.construction(ui); }
+        if self.tool == Tool::Transform {
+            section(ui, self.t(), "Transform");
+            ui.label(egui::RichText::new("Drag inside the box to move, a corner to scale, the round knob to rotate (Shift snaps to 15°). Leaves stay attached.").small().color(self.t().dim));
+            ui.horizontal(|ui| { if ui.button("Flip horizontal").clicked() { self.flip(Axis::Horizontal); } if ui.button("Flip vertical").clicked() { self.flip(Axis::Vertical); } });
+        }
+        section(ui, self.t(), "Backbone");
+        ui.horizontal(|ui| {
+            let n = self.layout.curves.len();
+            egui::ComboBox::from_id_salt("backbone").selected_text(format!("Backbone {}", self.backbone + 1)).show_ui(ui, |ui| { for i in 0..n { ui.selectable_value(&mut self.backbone, i, format!("Backbone {}", i + 1)); } });
+            if ui.add_enabled(n > 1, egui::Button::new("Remove")).clicked() { self.remove_backbone(); }
+        });
+        ui.label(egui::RichText::new("Draw another with the Pen tool (P). Start the stroke on a stem to grow it from that stem.").small().color(self.t().dim));
+        if let Some(parent) = self.layout.growth_for(self.backbone).attach {
+            ui.horizontal(|ui| {
+                ui.label(format!("Grows from backbone {}", parent + 1));
+                if ui.button("Detach").on_hover_text("Stop growing from that stem; the scroll stays where it is").clicked() { let mut g = self.settings(); g.attach = None; self.set_settings(g); }
+            });
+        }
+        let mut g = self.settings(); let before = g.clone();
+        ui.add_space(6.0);
+        let fam = g.family.unwrap_or(Family::Spiral);
+        egui::ComboBox::from_label("Pattern family").selected_text(family_label(fam)).show_ui(ui, |ui| {
+            for f in [Family::Spiral, Family::Branching, Family::Border, Family::Spray, Family::Fan] { if ui.selectable_label(fam == f, family_label(f)).clicked() { g.family = Some(f); } }
+        });
+        ui.horizontal(|ui| {
+            let mut seed = g.seed as i64;
+            ui.label("Variation"); if ui.add(egui::DragValue::new(&mut seed).range(0..=99999)).changed() { g.seed = seed as u32; }
+            if ui.button("New").clicked() { g.seed = g.seed.wrapping_mul(1103515245).wrapping_add(12345) % 100000; }
+        });
+        let mut auto = g.auto_shoots != Some(false); if ui.checkbox(&mut auto, "Grow automatic shoots").changed() { g.auto_shoots = Some(auto); }
+        let mut fit = g.free != Some(true); if ui.checkbox(&mut fit, "Fit scroll inside page").on_hover_text("Shrinks the scroll's eye and shoots to stay on the page. Moving, rotating or flipping turns this off so the design keeps its shape.").changed() { g.free = Some(!fit); }
+        ui.horizontal(|ui| {
+            ui.label("Wrapping leaves").on_hover_text("Leaves laid into the scroll's curl, following it toward the eye. The volute opens up to make room.");
+            let mut w = g.wraps.unwrap_or(0);
+            for (v, name) in [(0u8, "None"), (1, "One"), (2, "Two")] { ui.selectable_value(&mut w, v, name); }
+            if w != g.wraps.unwrap_or(0) { g.wraps = if w == 0 { None } else { Some(w) }; }
+        });
+        if g.wraps.unwrap_or(0) > 0 {
+            let current = g.wrap_leaf.as_deref().and_then(|id| LEAF_PRESETS.iter().find(|p| p.id == id)).map(|p| p.name).unwrap_or("Generated acanthus");
+            let mut pick: Option<Option<String>> = None;
+            egui::ComboBox::from_label("Wrap leaf").selected_text(current).show_ui(ui, |ui| {
+                if ui.selectable_label(g.wrap_leaf.is_none(), "Generated acanthus").clicked() { pick = Some(None); }
+                for p in LEAF_PRESETS { if ui.selectable_label(g.wrap_leaf.as_deref() == Some(p.id), p.name).clicked() { pick = Some(Some(p.id.to_string())); } }
+            }).response.on_hover_text("A library leaf laid into the curl, bent round it toward the eye. One layer only.");
+            if let Some(v) = pick { g.wrap_leaf = v; }
+        }
+        let mut leaves = g.leaves > 0; if ui.checkbox(&mut leaves, "Leaf lobes and folds").changed() { g.leaves = if leaves { 2 } else { 0 }; }
+        let mut two = g.levels == 2; if ui.checkbox(&mut two, "Three accent shoots (spiral)").changed() { g.levels = if two { 2 } else { 1 }; }
+        let mut companion = g.sweeps == Some(2); if ui.checkbox(&mut companion, "Supporting sweep").changed() { g.sweeps = Some(if companion { 2 } else { 1 }); }
+        let mut sec = g.secondary_scale.unwrap_or(1.0); if ui.add(egui::Slider::new(&mut sec, 0.5..=2.0).text("Shoot size")).changed() { g.secondary_scale = Some(sec); }
+        egui::ComboBox::from_label("Curl side").selected_text(match g.side { Side::Alternate => "Alternate", Side::Left => "Left", Side::Right => "Right" }).show_ui(ui, |ui| {
+            ui.selectable_value(&mut g.side, Side::Alternate, "Alternate"); ui.selectable_value(&mut g.side, Side::Left, "Left"); ui.selectable_value(&mut g.side, Side::Right, "Right");
+        });
+        if g != before { self.set_settings(g); }
+        section(ui, self.t(), "Page");
+        let (mut w, mut h) = (self.layout.width, self.layout.height);
+        ui.horizontal(|ui| { ui.label("Width"); ui.add(egui::DragValue::new(&mut w).range(40.0..=1000.0).suffix(" mm")); ui.label("Height"); ui.add(egui::DragValue::new(&mut h).range(40.0..=1000.0).suffix(" mm")); });
+        if w != self.layout.width || h != self.layout.height {
+            let mut next = self.layout.clone(); let (sx, sy) = (w / next.width, h / next.height);
+            for c in next.curves.iter_mut() { *c = c.map(|p| pt(p.x * sx, p.y * sy)); }
+            next.width = w; next.height = h; next.locked_parts.clear(); self.commit(next); self.fitted = false; self.skel_thumbs = vec![None; Skeleton::ALL.len()];
+        }
+        let mut pb = self.layout.print_backbone; if ui.checkbox(&mut pb, "Include backbone line in SVG").changed() { let mut n = self.layout.clone(); n.print_backbone = pb; self.commit(n); }
+    }
+
+    /// Named constructions of linked scrolls. Building one replaces the
+    /// design (Undo brings it back); everything stays editable afterwards.
+    fn construction(&mut self, ui: &mut egui::Ui) {
+        let t = self.t();
+        section(ui, t, "Construction");
+        // Thumbnails: one per frame, grown at the page's proportions.
+        if let Some(i) = self.skel_thumbs.iter().position(|x| x.is_none()) {
+            let (w, h) = (self.layout.width, self.layout.height);
+            let d = layered_drawing(&skeleton_layout(Skeleton::ALL[i], 0, w, h).grow()); let s = w.max(h);
+            self.skel_thumbs[i] = Some(d.outline.iter().map(|r| r.iter().map(|p| pt(p.x / s, p.y / s)).collect()).collect());
+            ui.ctx().request_repaint();
+        }
+        let gap = 6.0; let w = (ui.available_width() - gap) / 2.0;
+        let mut build: Option<(Skeleton, u32)> = None;
+        for (row, pair) in Skeleton::ALL.chunks(2).enumerate() {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                for (k, kind) in pair.iter().enumerate() {
+                    let i = row * 2 + k;
+                    let (resp, painter) = ui.allocate_painter(Vec2::new(w, w * 0.74), Sense::click());
+                    let r = resp.rect; let sel = self.skeleton == Some(*kind);
+                    painter.rect_filled(r, 8.0, if resp.hovered() { t.hover } else { t.surface });
+                    if sel { painter.rect_stroke(r, 8.0, Stroke::new(2.0, t.text)); }
+                    let art = Rect::from_min_max(r.min + Vec2::new(8.0, 6.0), Pos2::new(r.right() - 8.0, r.bottom() - 22.0));
+                    let aspect = (self.layout.height / self.layout.width.max(self.layout.height)) as f32;
+                    let side = art.width().min(art.height() / aspect.max(0.1));
+                    let origin = Pos2::new(art.center().x - side / 2.0, art.center().y - side * aspect / 2.0);
+                    if let Some(Some(lines)) = self.skel_thumbs.get(i) { for l in lines { painter.add(Shape::line(l.iter().map(|p| origin + Vec2::new(p.x as f32 * side, p.y as f32 * side)).collect(), Stroke::new(0.9, t.text))); } }
+                    painter.text(Pos2::new(r.left() + 8.0, r.bottom() - 11.0), egui::Align2::LEFT_CENTER, kind.name(), egui::FontId::proportional(12.5), t.text);
+                    let resp = resp.on_hover_text(kind.detail());
+                    if resp.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
+                    if resp.clicked() { build = Some((*kind, if sel { self.skel_seed } else { 0 })); }
+                }
+            });
+        }
+        if let Some(kind) = self.skeleton {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(format!("{} · variation {}", kind.name(), self.skel_seed + 1)).color(t.text));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("New variation").clicked() { build = Some((kind, self.skel_seed.wrapping_add(1))); }
+                });
+            });
+        }
+        ui.label(egui::RichText::new("Builds linked scrolls on your page. It replaces the current design; Undo brings it back. Every backbone stays editable.").small().color(t.dim));
+        if let Some((kind, seed)) = build {
+            let mut next = skeleton_layout(kind, seed, self.layout.width, self.layout.height);
+            next.print_backbone = self.layout.print_backbone;
+            self.commit(next);
+            self.skeleton = Some(kind); self.skel_seed = seed;
+            self.backbone = 0; self.selected = None;
+            self.message = format!("{}: {}.", kind.name(), kind.detail());
+        }
+    }
+
+    fn shoot_properties(&mut self, ui: &mut egui::Ui) {
+        let Some(part) = self.selected_part() else { return };
+        let sh = part.shoot.clone().unwrap();
+        let under = self.selected_edit().map_or(false, |e| e.under);
+        let edited = self.selected_edit().map_or(false, |e| e.replaces.is_some());
+        let bud = sh.preset.as_deref().is_some_and(is_bud);
+        section(ui, self.t(), if bud { "Selected bud" } else { "Selected leaf" });
+        let measured = sh.preset.as_deref().and_then(profile);
+        if bud {
+            let current = sh.preset.as_deref().and_then(|id| BUD_PRESETS.iter().find(|p| p.id == id)).map(|p| p.name).unwrap_or("Bud");
+            let mut pick: Option<&'static str> = None;
+            egui::ComboBox::from_label("Bud type").selected_text(current).show_ui(ui, |ui| { for p in BUD_PRESETS { if ui.selectable_label(sh.preset.as_deref() == Some(p.id), p.name).clicked() { pick = Some(p.id); } } });
+            if let Some(id) = pick { self.patch_shoot(|e| e.params.preset = Some(id.into())); return; }
+            ui.label(egui::RichText::new("Drag the filled dot along the stem to move the bud; drag the open dot to swing and size it. At the very end of a stem, set Angle to 0 to finish the stem with it.").small().color(self.t().dim));
+        } else {
+            let current = sh.preset.as_deref().and_then(|id| LEAF_PRESETS.iter().find(|p| p.id == id)).map(|p| p.name).unwrap_or("Generated acanthus");
+            let mut pick: Option<&'static str> = None;
+            egui::ComboBox::from_label("Leaf type").selected_text(current).show_ui(ui, |ui| { for p in LEAF_PRESETS { if ui.selectable_label(sh.preset.as_deref() == Some(p.id), p.name).clicked() { pick = Some(p.id); } } });
+            if let Some(id) = pick { let prof = profile(id).unwrap(); self.patch_shoot(|e| { e.params.preset = Some(id.into()); e.params.turn = prof.frame * e.params.side; e.params.bend = Some(0.0); e.params.leaf_scale = Some(1.0); e.params.leaf_side = None; e.params.lobes = None; e.params.depth = None; e.params.stalk = None; e.params.taper = None; e.params.stem = None; }); return; }
+            ui.label(egui::RichText::new("Drag the filled dot along the stem to move the root; drag the open dot to swing and size the leaf.").small().color(self.t().dim));
+        }
+        let mut size = sh.reach * 100.0;
+        if ui.add(egui::Slider::new(&mut size, 2.0..=if bud { 40.0 } else { 80.0 }).text("Size (% of stem)").fixed_decimals(0)).changed() { self.patch_shoot(|e| e.params.reach = size / 100.0); }
+        if bud {
+        } else if measured.is_some() {
+            let mut bend = sh.bend.unwrap_or(0.0); if ui.add(egui::Slider::new(&mut bend, -1.5..=1.5).text("Bend")).changed() { self.patch_shoot(|e| e.params.bend = Some(bend)); }
+            let mut width = sh.leaf_scale.unwrap_or(1.0); if ui.add(egui::Slider::new(&mut width, 0.6..=1.6).text("Width")).changed() { self.patch_shoot(|e| e.params.leaf_scale = Some(width)); }
+            let mut follow = sh.follow.unwrap_or(0.0) * 100.0;
+            if ui.add(egui::Slider::new(&mut follow, 0.0..=100.0).text("Follow stem %").fixed_decimals(0)).on_hover_text("Bend the leaf along the stem it grows from, round the volute. It bends only as far as it fits.").changed() { self.patch_shoot(|e| e.params.follow = if follow > 0.0 { Some(follow / 100.0) } else { None }); }
+        } else {
+            let mut curl = sh.curl; if ui.add(egui::Slider::new(&mut curl, 0.2..=1.2).text("Curl")).changed() { self.patch_shoot(|e| e.params.curl = curl); }
+        }
+        let lean = measured.map_or(0.0, |p| sh.side * p.frame);
+        let mut angle = (sh.turn - lean).to_degrees();
+        if ui.add(egui::Slider::new(&mut angle, -180.0..=180.0).text("Angle °").fixed_decimals(0)).changed() { self.patch_shoot(|e| e.params.turn = angle.to_radians() + lean); }
+        let mut on_top = !under; if ui.checkbox(&mut on_top, "On top").changed() { self.patch_shoot(|e| e.under = !on_top); }
+        ui.label(egui::RichText::new("Unticked leaves sit beneath the main sweep. The root stays joined either way.").small().color(self.t().dim));
+        ui.horizontal(|ui| {
+            if bud { if ui.button("Mirror").clicked() { self.patch_shoot(|e| { e.params.turn = -e.params.turn; e.params.side = -e.params.side; }); } }
+            else if ui.button("Mirror").clicked() { self.patch_shoot(|e| { let frame = e.params.preset.as_deref().and_then(profile).map_or(0.0, |p| p.frame); if frame != 0.0 { e.params.turn -= 2.0 * e.params.side * frame; } e.params.side = -e.params.side; e.params.leaf_side = None; }); }
+            if ui.button("Delete").clicked() { self.remove_selected(); }
+            if edited && ui.button("Return to generated").clicked() {
+                if let Some(e) = self.selected_edit().cloned() { let mut n = self.layout.clone(); n.shoots.retain(|x| !(x.id == e.id && x.backbone == e.backbone)); self.commit(n); self.selected = None; }
+            }
+        });
+    }
+
+    fn leaves(&mut self, ui: &mut egui::Ui) {
+        let t = self.t();
+        // My presets: saved scroll designs
+        if self.scroll_thumbs.len() != self.scroll_presets.entries.len() { self.scroll_thumbs = vec![None; self.scroll_presets.entries.len()]; }
+        // Grow at most one missing thumbnail per frame to keep the panel responsive.
+        if let Some(i) = self.scroll_thumbs.iter().position(|t| t.is_none()) {
+            let thumb = io::parse(&self.scroll_presets.entries[i].data.to_string()).map(|l| { let d = layered_drawing(&l.grow()); let s = l.width.max(l.height);
+                d.outline.iter().map(|r| r.iter().map(|p| pt(p.x / s, p.y / s)).collect()).collect() }).unwrap_or_default();
+            self.scroll_thumbs[i] = Some(thumb);
+            ui.ctx().request_repaint();
+        }
+        let current: serde_json::Value = serde_json::from_str(&io::save(&self.layout)).unwrap();
+        let thumbs = self.scroll_thumbs.clone();
+        let mut load: Option<Layout> = None;
+        section(ui, t, "My presets");
+        presets_panel(ui, t, &mut self.scroll_presets, &thumbs, current, "Scroll", |d| { if let Ok(l) = io::parse(&d.to_string()) { load = Some(l); } });
+        if self.scroll_thumbs.len() != self.scroll_presets.entries.len() { self.scroll_thumbs.clear(); }
+        if let Some(l) = load { self.commit(l); self.backbone = 0; self.selected = None; self.fitted = false; self.message = "Preset loaded. Undo returns to your previous design.".into(); }
+        section(ui, self.t(), "Leaf types");
+        ui.label(egui::RichText::new(format!("Click to grow one from backbone {}. Each grows on its own measured spine.", self.backbone + 1)).small().color(self.t().dim));
+        ui.add_space(6.0);
+        for p in LEAF_PRESETS { if library_card(ui, self.t(), p.id, p.name, p.detail) { self.add_leaf(p.id); } }
+        section(ui, self.t(), "Buds");
+        ui.label(egui::RichText::new("Finish a stem, or set one where two leaves part from the same root.").small().color(self.t().dim));
+        ui.add_space(6.0);
+        for p in BUD_PRESETS { if library_card(ui, self.t(), p.id, p.name, p.detail) { self.add_leaf(p.id); } }
+    }
+
+    fn layers(&mut self, ui: &mut egui::Ui) {
+        section(ui, self.t(), "Layers");
+        ui.label(egui::RichText::new("Top of the list is drawn on top.").small().color(self.t().dim));
+        let parts: Vec<(String, String, bool)> = self.grown.parts.iter().rev().map(|p| {
+            let name = if p.parent.is_none() { "Main sweep".to_string() } else if p.id.rsplit('/').next().is_some_and(|s| s.starts_with("wrap-")) { "Wrapping leaf".to_string() } else if let Some(n) = p.shoot.as_ref().and_then(|s| s.preset.as_deref()).and_then(|id| LEAF_PRESETS.iter().find(|q| q.id == id).map(|q| q.name).or_else(|| BUD_PRESETS.iter().find(|q| q.id == id).map(|q| q.name))) { n.to_string() } else { "Acanthus shoot".to_string() };
+            let (b, _) = self.split_id(&p.id);
+            (p.id.clone(), if self.multi() { format!("{name} · backbone {}", b + 1) } else { name }, p.parent.is_some() && p.shoot.is_some())
+        }).collect();
+        for (id, name, selectable) in parts {
+            let sel = self.selected.as_deref() == Some(id.as_str());
+            if ui.add_enabled(selectable, egui::SelectableLabel::new(sel, name)).clicked() { self.selected = Some(id); self.tool = Tool::Select; }
+        }
+    }
+
+    fn carving_tab(&mut self, ui: &mut egui::Ui) {
+        section(ui, self.t(), "Carving guides");
+        if ui.checkbox(&mut self.carving, "Show suggested relief").changed() { self.stale = true; }
+        ui.label(egui::RichText::new("Solid lines: visible edges. Blue dashed: raised ridges (midribs). Red dotted: recessed creases. Suggestions to review, not cutting depths or toolpaths. Exports are always black on white.").small().color(self.t().dim));
+        ui.add_space(8.0);
+        if ui.button("Export carving guides SVG…").clicked() { self.export(true); }
+        if ui.button("Export pattern SVG…").clicked() { self.export(false); }
+    }
+
+    fn theme_tab(&mut self, ui: &mut egui::Ui) {
+        let t = self.t();
+        section(ui, t, "Theme");
+        for id in ThemeId::ALL {
+            let th = id.theme();
+            let sel = self.prefs.theme == id;
+            let (resp, painter) = ui.allocate_painter(Vec2::new(ui.available_width(), 78.0), Sense::click());
+            let r = resp.rect;
+            painter.rect_filled(r, 10.0, th.bg);
+            painter.rect_stroke(r, 10.0, if sel { Stroke::new(2.0, t.text) } else if resp.hovered() { Stroke::new(1.0, t.dim) } else { Stroke::new(1.0, t.border) });
+            // miniature: desk, page and a small scroll in the theme's ink
+            let desk = Rect::from_min_size(r.min + Vec2::new(10.0, 10.0), Vec2::new(86.0, 58.0));
+            painter.rect_filled(desk, 6.0, th.desk);
+            let page = desk.shrink2(Vec2::new(12.0, 8.0));
+            painter.rect_filled(page, 2.0, th.paper);
+            painter.add(Shape::line(mini_scroll(page), Stroke::new(1.3, th.ink)));
+            // swatches
+            for (k, col) in [th.surface, th.accent, th.text].iter().enumerate() {
+                painter.circle_filled(Pos2::new(r.right() - 18.0 - k as f32 * 16.0, r.top() + 18.0), 5.5, *col);
+            }
+            let x = desk.right() + 12.0;
+            painter.text(Pos2::new(x, r.top() + 20.0), egui::Align2::LEFT_CENTER, th.name, egui::FontId::new(14.5, egui::FontFamily::Name("semibold".into())), th.text);
+            let wrap = (r.right() - x - 10.0).max(60.0);
+            let galley = painter.layout(th.blurb.to_string(), egui::FontId::proportional(12.0), th.dim, wrap);
+            painter.galley(Pos2::new(x, r.top() + 34.0), galley, th.dim);
+            if resp.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
+            if resp.clicked() { self.set_prefs(Prefs { theme: id, ..self.prefs }); }
+            ui.add_space(4.0);
+        }
+        section(ui, t, "Canvas");
+        let dark_page = t.paper.r() < 128;
+        let mut white = self.prefs.white_page;
+        if ui.add_enabled(dark_page, egui::Checkbox::new(&mut white, "Show the page as white paper")).changed() { self.set_prefs(Prefs { white_page: white, ..self.prefs }); }
+        ui.label(egui::RichText::new(if dark_page { "Keeps the dark interface but previews the pattern as it will print." } else { "This theme already shows a light page." }).small().color(t.dim));
+        section(ui, t, "Interface size");
+        let resp = ui.add(egui::Slider::new(&mut self.scale_draft, 0.8..=1.5).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)).step_by(0.05));
+        // Rescaling mid-drag would move the slider under the pointer, so apply on release.
+        if resp.drag_stopped() || (resp.changed() && !resp.dragged()) { self.set_prefs(Prefs { ui_scale: self.scale_draft, ..self.prefs }); }
+        ui.label(egui::RichText::new("Scales all text and controls. Saved for next time.").small().color(t.dim));
+    }
+
+    fn flip(&mut self, axis: Axis) {
+        let center = self.part_bounds().center();
+        let mut next = self.layout.clone();
+        while next.growth.len() < next.curves.len() { let g = next.growth_for(next.growth.len()); next.growth.push(g); }
+        for b in self.group() {
+            next.curves[b] = flip_curve(&next.curves[b], axis, center);
+            next.growth[b].flip = Some(next.growth[b].flip != Some(true));
+            next.growth[b].free = Some(true);
+            for e in next.shoots.iter_mut().filter(|e| e.backbone == b) { e.params = mirror_shoot(&e.params); }
+        }
+        next.locked_parts.clear();
+        self.commit(next);
+    }
+    fn remove_backbone(&mut self) {
+        let b = self.backbone; let mut next = self.layout.clone();
+        next.curves.remove(b); if b < next.growth.len() { next.growth.remove(b); }
+        next.shoots.retain(|e| e.backbone != b); for e in next.shoots.iter_mut() { if e.backbone > b { e.backbone -= 1; } }
+        for g in next.growth.iter_mut() { g.attach = match g.attach { Some(a) if a == b => None, Some(a) if a > b => Some(a - 1), other => other }; }
+        next.locked_parts.clear(); self.commit(next); self.backbone = 0; self.selected = None;
+    }
+
+    // ---------- canvas ----------
+    fn canvas(&mut self, ui: &mut egui::Ui) {
+        let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
+        let rect = resp.rect;
+        if !self.fitted { self.fit(rect); }
+        // zoom about the cursor, pan with middle/right drag or space+drag
+        if let Some(hover) = resp.hover_pos() {
+            let (scroll, zoom_delta) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
+            let factor = if zoom_delta != 1.0 { zoom_delta } else { (scroll * 0.0015).exp() };
+            if (factor - 1.0).abs() > 1e-4 {
+                let before = self.to_mm(hover);
+                self.zoom = (self.zoom * factor).clamp(0.3, 60.0);
+                let after = self.to_screen(before);
+                self.origin += hover - after;
+            }
+            self.cursor_mm = Some(self.to_mm(hover));
+        }
+        let pan_button = ui.input(|i| i.pointer.middle_down() || i.pointer.secondary_down() || i.key_down(egui::Key::Space));
+        let c = self.canvas_colors();
+        let ink = c.ink; let guide = c.guide; let mark = c.mark; let ridge = c.ridge; let crease = c.crease; let sheet = c.paper;
+        let paper = Rect::from_min_max(self.to_screen(pt(0.0, 0.0)), self.to_screen(pt(self.layout.width, self.layout.height)));
+        for (grow, alpha) in [(10.0, 10u8), (5.0, 16), (2.0, 24)] { painter.rect_filled(paper.expand(grow).translate(Vec2::new(0.0, grow * 0.4)), grow + 2.0, Color32::from_black_alpha(alpha)); }
+        painter.rect_filled(paper, 2.0, sheet);
+        if self.grid { self.paint_grid(&painter, paper); }
+        let stroke_w = (0.45 * self.zoom).clamp(1.6, 3.0);
+        let fold_w = (0.2 * self.zoom).clamp(0.7, 1.4);
+        // selected highlight under the ink
+        if let Some(part) = self.selected_part() {
+            let poly: Vec<Pos2> = part.polygon.iter().map(|p| self.to_screen(*p)).collect();
+            painter.add(Shape::closed_line(poly, Stroke::new(stroke_w * 5.0, with_alpha(mark, 45))));
+        }
+        if let (true, Some(g)) = (self.carving, self.guides.as_ref()) {
+            for r in &g.outline { painter.add(Shape::line(r.iter().map(|p| self.to_screen(*p)).collect(), Stroke::new(stroke_w, ink))); }
+            for r in &g.ridges { painter.extend(Shape::dashed_line(&r.iter().map(|p| self.to_screen(*p)).collect::<Vec<_>>(), Stroke::new(fold_w, ridge), 6.0, 3.0)); }
+            for r in &g.creases { painter.extend(Shape::dotted_line(&r.iter().map(|p| self.to_screen(*p)).collect::<Vec<_>>(), crease, 3.5, fold_w * 0.6)); }
+        } else {
+            for r in &self.drawing.outline { painter.add(Shape::line(r.iter().map(|p| self.to_screen(*p)).collect(), Stroke::new(stroke_w, ink))); }
+            for r in &self.drawing.folds { painter.add(Shape::line(r.iter().map(|p| self.to_screen(*p)).collect(), Stroke::new(fold_w, ink))); }
+        }
+        // backbone guides and handles
+        if self.show_guides && self.tool != Tool::Transform {
+            for (i, c) in self.layout.curves.iter().enumerate() {
+                let pts: Vec<Pos2> = (0..=60).map(|k| { let t = k as f64 / 60.0; self.to_screen(scroll_core::geometry::at(c, t)) }).collect();
+                let w = if i == self.backbone { 1.2 } else { 2.0 };
+                painter.extend(Shape::dashed_line(&pts, Stroke::new(w, guide), 6.0, 5.0));
+            }
+            let c = self.layout.curves[self.backbone];
+            painter.extend(Shape::dashed_line(&[self.to_screen(c[0]), self.to_screen(c[1])], Stroke::new(1.0, guide), 3.0, 3.0));
+            painter.extend(Shape::dashed_line(&[self.to_screen(c[2]), self.to_screen(c[3])], Stroke::new(1.0, guide), 3.0, 3.0));
+            for (i, p) in c.iter().enumerate() { painter.circle(self.to_screen(*p), 5.5, if i == 0 || i == 3 { mark } else { sheet }, Stroke::new(1.5, mark)); }
+        }
+        // selected leaf handles
+        let mut handles: Option<(Pos2, Pos2)> = None;
+        if self.tool == Tool::Select { if let Some(part) = self.selected_part() {
+            let root = self.to_screen(part.points[0]); let tip = self.to_screen(tip_handle(part));
+            painter.extend(Shape::dashed_line(&[root, tip], Stroke::new(1.0, mark), 4.0, 4.0));
+            painter.circle(root, 6.5, mark, Stroke::new(1.5, sheet));
+            painter.circle(tip, 6.5, sheet, Stroke::new(2.0, mark));
+            handles = Some((root, tip));
+        } }
+        // transform box
+        let mut xf_box: Option<(Rect, Pos2)> = None;
+        if self.tool == Tool::Transform {
+            let b = self.part_bounds();
+            let r = Rect::from_min_max(self.to_screen(pt(b.l, b.t)), self.to_screen(pt(b.r, b.b))).expand(8.0);
+            let knob = Pos2::new(r.center().x, r.top() - 28.0);
+            painter.rect_filled(r, 0.0, with_alpha(mark, 10));
+            painter.extend(Shape::dashed_line(&[r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()], Stroke::new(1.2, mark), 6.0, 4.0));
+            painter.line_segment([Pos2::new(r.center().x, r.top()), knob], Stroke::new(1.2, mark));
+            painter.circle(knob, 7.0, sheet, Stroke::new(1.8, mark));
+            for c in [r.left_top(), r.right_top(), r.left_bottom(), r.right_bottom()] { painter.rect(Rect::from_center_size(c, Vec2::splat(10.0)), 2.0, sheet, Stroke::new(1.6, mark)); }
+            xf_box = Some((r, knob));
+        }
+        // pen trace
+        if let Some(Drag::Draw { points }) = &self.drag { painter.add(Shape::line(points.iter().map(|p| self.to_screen(*p)).collect(), Stroke::new(2.0, c.mark))); }
+
+        // ----- interaction -----
+        let pointer = resp.interact_pointer_pos();
+        if resp.drag_started() {
+            // Hit-test where the button went down: by the time egui reports a
+            // drag the pointer has moved past its threshold, off small handles.
+            let pos = ui.input(|i| i.pointer.press_origin()).or(pointer).unwrap_or_default();
+            let mm = self.to_mm(pos);
+            self.drag_before = Some(self.layout.clone());
+            self.drag = if pan_button { Some(Drag::Pan) } else { match self.tool {
+                Tool::Pen => Some(Drag::Draw { points: vec![mm] }),
+                Tool::Transform => xf_box.map(|(r, knob)| {
+                    let b = self.part_bounds(); let center = b.center(); let curves: Vec<(usize, Curve)> = self.group().into_iter().map(|i| (i, self.layout.curves[i])).collect();
+                    let corner = [r.left_top(), r.right_top(), r.left_bottom(), r.right_bottom()].iter().any(|c| c.distance(pos) < 12.0);
+                    let kind = if knob.distance(pos) < 14.0 { TransformKind::Rotate } else if corner { TransformKind::Scale } else { TransformKind::Move };
+                    Some(Drag::Transform { kind, center, from: mm, curves })
+                }).flatten().map(|d| { self.set_free(); d }),
+                // Left-drag on empty paper does nothing; pan with middle or
+                // right drag, or hold Space.
+                Tool::Select => self.pick_drag(pos, mm, handles),
+            } };
+        }
+        if resp.dragged() {
+            let delta = resp.drag_delta();
+            let pos = pointer.unwrap_or_default(); let mm = self.to_mm(pos); let shift = ui.input(|i| i.modifiers.shift);
+            match self.drag.as_mut() {
+                Some(Drag::Pan) => self.origin += delta,
+                Some(Drag::Draw { points }) => points.push(mm),
+                Some(Drag::Handle { index }) => { let i = *index; let b = self.backbone;
+                    // An attached scroll's start slides along its parent's stem, keeping its shape.
+                    if !(i == 0 && self.layout.slide_attached(b, mm)) { self.layout.curves[b][i] = pt(mm.x.clamp(0.0, self.layout.width), mm.y.clamp(0.0, self.layout.height)); }
+                    self.layout.locked_parts.clear(); self.stale = true; }
+                Some(Drag::ShootRoot { edit, backbone }) => { let (id, b) = (edit.clone(), *backbone); let pr = nearest_progress(&self.layout.curves[b], mm); if let Some(e) = self.layout.shoots.iter_mut().find(|e| e.id == id && e.backbone == b) { e.params.progress = pr; } self.stale = true; }
+                Some(Drag::ShootTip { edit, start, root, handle }) => { let (reach, turn) = drag_tip(start, *root, *handle, mm); let id = edit.clone(); if let Some(e) = self.layout.shoots.iter_mut().find(|e| e.id == id) { e.params.reach = reach; e.params.turn = turn; } self.stale = true; }
+                Some(Drag::Transform { kind, center, from, curves }) => { for (i, curve) in curves.iter() { self.layout.curves[*i] = transform_curve(curve, *kind, *center, *from, mm, shift); } self.layout.locked_parts.clear(); self.stale = true; }
+                None => {}
+            }
+        }
+        if resp.drag_stopped() {
+            if let Some(Drag::Draw { points }) = self.drag.take() {
+                if let Some(c) = fit_curve(&points) {
+                    // Starting the stroke on an existing sweep grows the new
+                    // scroll out of it.
+                    let host = (0..self.layout.curves.len()).find(|&b| { let pre = format!("backbone-{b}/");
+                        self.grown.parts.iter().any(|p| p.parent.is_none() && (!self.multi() || p.id.starts_with(&pre)) && inside(points[0], &p.polygon)) });
+                    let mut next = self.layout.clone();
+                    let mut g = next.growth_for(self.backbone); next.growth.resize(next.curves.len(), g.clone());
+                    g.attach = host; g.free = Some(true); if host.is_some() { g.levels = 1; }
+                    next.curves.push(c); next.growth.push(g);
+                    self.commit(next);
+                    self.backbone = self.layout.curves.len() - 1; self.tool = Tool::Select;
+                    self.message = match host { Some(h) => format!("New scroll grows from backbone {}. Drag its handles to refine it.", h + 1), None => "Backbone drawn. Drag its four handles to refine the sweep.".into() };
+                } else { self.message = "Draw a longer sweep to create a backbone.".into(); }
+            } else if let Some(before) = self.drag_before.take() {
+                if !matches!(self.drag, Some(Drag::Pan)) { self.past.push(before); self.future.clear(); self.dirty = true; }
+            }
+            self.drag = None; self.drag_before = None;
+        }
+        if resp.clicked() && self.tool == Tool::Select {
+            if let Some(pos) = pointer { let mm = self.to_mm(pos); self.selected = self.hit_leaf(mm); }
+        }
+    }
+
+    /// What a drag in the Select tool grabs, in priority order.
+    fn pick_drag(&mut self, pos: Pos2, mm: Point, handles: Option<(Pos2, Pos2)>) -> Option<Drag> {
+        if let (Some((root, tip)), Some(sel)) = (handles, self.selected.clone()) {
+            let on_root = root.distance(pos) < 12.0; let on_tip = tip.distance(pos) < 12.0;
+            if on_root || on_tip {
+                let part = self.selected_part()?.clone();
+                let mut next = self.layout.clone();
+                let id = self.take_over(&mut next, &sel)?;
+                let (b, _) = self.split_id(&sel);
+                self.layout = next; self.stale = true;
+                let e = self.layout.shoots.iter().find(|e| e.id == id && e.backbone == b)?.clone();
+                self.selected = Some(self.display_id(&e));
+                return Some(if on_root { Drag::ShootRoot { edit: id, backbone: b } } else { Drag::ShootTip { edit: id, start: e.params.clone(), root: part.points[0], handle: tip_handle(&part) } });
+            }
+        }
+        if self.show_guides {
+            for (i, p) in self.layout.curves[self.backbone].iter().enumerate() { if self.to_screen(*p).distance(pos) < 10.0 { return Some(Drag::Handle { index: i }); } }
+            for (bi, c) in self.layout.curves.iter().enumerate() { if bi != self.backbone { for p in c { if self.to_screen(*p).distance(pos) < 10.0 { self.backbone = bi; } } } }
+        }
+        // grabbing a leaf body moves its root along the stem
+        if let Some(id) = self.hit_leaf(mm) {
+            self.selected = Some(id.clone());
+            let mut next = self.layout.clone(); let local = self.take_over(&mut next, &id)?; let (b, _) = self.split_id(&id);
+            self.layout = next; self.stale = true;
+            if let Some(e) = self.layout.shoots.iter().find(|e| e.id == local && e.backbone == b).cloned() { self.selected = Some(self.display_id(&e)); }
+            return Some(Drag::ShootRoot { edit: local, backbone: b });
+        }
+        None
+    }
+    fn hit_leaf(&self, mm: Point) -> Option<String> {
+        self.grown.parts.iter().rev().find(|p| p.parent.is_some() && p.shoot.is_some() && inside(mm, &p.polygon)).map(|p| p.id.clone())
+    }
+    fn paint_grid(&self, painter: &egui::Painter, paper: Rect) {
+        let grid = self.canvas_colors().grid;
+        let step = if self.zoom > 8.0 { 1.0 } else if self.zoom > 2.0 { 5.0 } else { 10.0 };
+        let mut x = 0.0; while x <= self.layout.width { let a = self.to_screen(pt(x, 0.0)); painter.line_segment([Pos2::new(a.x, paper.top()), Pos2::new(a.x, paper.bottom())], Stroke::new(if (x as i64) % 10 == 0 { 0.8 } else { 0.4 }, grid)); x += step; }
+        let mut y = 0.0; while y <= self.layout.height { let a = self.to_screen(pt(0.0, y)); painter.line_segment([Pos2::new(paper.left(), a.y), Pos2::new(paper.right(), a.y)], Stroke::new(if (y as i64) % 10 == 0 { 0.8 } else { 0.4 }, grid)); y += step; }
+    }
+}
+
+/// Segmented control: a row of equal-width options in a rounded track.
+fn segmented<T: PartialEq + Copy>(ui: &mut egui::Ui, t: &Theme, options: &[(T, &str)], value: &mut T) {
+    egui::Frame::none().fill(t.surface).rounding(8.0).inner_margin(egui::Margin::same(3.0)).show(ui, |ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        let n = options.len() as f32;
+        let w = ((ui.available_width() - 2.0 * (n - 1.0)) / n).max(30.0);
+        ui.horizontal(|ui| {
+            for (v, name) in options {
+                let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 26.0), Sense::click());
+                let sel = *value == *v;
+                ui.painter().rect_filled(rect, 6.0, if sel { t.accent } else if resp.hovered() { t.hover } else { Color32::TRANSPARENT });
+                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, *name, egui::FontId::new(13.0, if sel { egui::FontFamily::Name("semibold".into()) } else { egui::FontFamily::Proportional }), if sel || resp.hovered() { t.text } else { t.dim });
+                if resp.clicked() { *value = *v; }
+            }
+        });
+    });
+}
+
+/// "My presets": save the current design, and pick, rename, duplicate or
+/// delete saved ones. Thumbnails are outlines in a unit square.
+fn presets_panel(ui: &mut egui::Ui, t: &Theme, lib: &mut presets::Library, thumbs: &[Option<Vec<Vec<Point>>>], current: serde_json::Value, fallback: &str, mut load: impl FnMut(&serde_json::Value)) {
+    ui.horizontal(|ui| {
+        ui.add(egui::TextEdit::singleline(&mut lib.name).hint_text("Name this design").desired_width(ui.available_width() - 70.0));
+        if ui.button("Save").on_hover_text("Save the current design as a preset").clicked() { lib.add(current, fallback); }
+    });
+    let cols = 2usize; let gap = 6.0;
+    let w = (ui.available_width() - gap) / cols as f32;
+    let mut clicked = None;
+    for (row, chunk) in lib.entries.chunks(cols).enumerate() {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            for (k, e) in chunk.iter().enumerate() {
+                let i = row * cols + k;
+                let (resp, painter) = ui.allocate_painter(Vec2::new(w, w * 0.78), Sense::click());
+                let r = resp.rect; let sel = lib.selected == Some(i);
+                painter.rect_filled(r, 8.0, if resp.hovered() { t.hover } else { t.surface });
+                if sel { painter.rect_stroke(r, 8.0, Stroke::new(2.0, t.text)); }
+                let art = Rect::from_min_max(r.min + Vec2::new(8.0, 8.0), Pos2::new(r.right() - 8.0, r.bottom() - 24.0));
+                let side = art.width().min(art.height());
+                let origin = Pos2::new(art.center().x - side / 2.0, art.top());
+                if let Some(Some(lines)) = thumbs.get(i) {
+                    for l in lines { painter.add(Shape::line(l.iter().map(|p| origin + Vec2::new(p.x as f32 * side, p.y as f32 * side)).collect(), Stroke::new(1.0, t.text))); }
+                }
+                let name: String = if e.name.chars().count() > 24 { format!("{}…", e.name.chars().take(23).collect::<String>()) } else { e.name.clone() };
+                painter.text(Pos2::new(r.left() + 8.0, r.bottom() - 12.0), egui::Align2::LEFT_CENTER, name, egui::FontId::proportional(12.5), t.text);
+                if resp.clicked() { clicked = Some(i); }
+            }
+        });
+    }
+    if let Some(i) = clicked { lib.selected = Some(i); lib.name = lib.entries[i].name.clone(); load(&lib.entries[i].data.clone()); }
+    if lib.selected.is_some() {
+        ui.horizontal(|ui| {
+            if ui.button("Rename").clicked() { lib.rename(); }
+            if ui.button("Duplicate").clicked() { lib.duplicate(); }
+            if ui.button("Delete").clicked() { lib.delete(); }
+        });
+    }
+    if lib.deleted.is_some() && ui.button("Undo delete").clicked() { lib.undo_delete(); }
+    if lib.entries.is_empty() { ui.label(egui::RichText::new("No presets yet. Name the current design and press Save.").small().color(t.dim)); }
+    if !lib.message.is_empty() { ui.label(egui::RichText::new(&lib.message).small().color(t.dim)); }
+}
+
+/// A clickable library card: thumbnail, name and a one-line description.
+fn library_card(ui: &mut egui::Ui, t: &Theme, id: &str, name: &str, detail: &str) -> bool {
+    let (resp, painter) = ui.allocate_painter(Vec2::new(ui.available_width(), 80.0), Sense::click());
+    painter.rect_filled(resp.rect, 8.0, if resp.hovered() { t.hover } else { t.surface });
+    let thumb = Rect::from_min_size(resp.rect.min + Vec2::new(8.0, 8.0), Vec2::splat(64.0));
+    draw_thumbnail(&painter, thumb, id, t.text);
+    painter.text(Pos2::new(thumb.right() + 12.0, resp.rect.top() + 28.0), egui::Align2::LEFT_CENTER, name, egui::FontId::new(14.5, egui::FontFamily::Name("semibold".into())), t.text);
+    painter.text(Pos2::new(thumb.right() + 12.0, resp.rect.top() + 50.0), egui::Align2::LEFT_CENTER, detail, egui::FontId::proportional(12.5), t.dim);
+    if resp.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
+    ui.add_space(4.0);
+    resp.clicked()
+}
+
+/// Small, dim, upper-case section label.
+fn section(ui: &mut egui::Ui, t: &Theme, title: &str) {
+    ui.add_space(12.0);
+    ui.label(egui::RichText::new(title.to_uppercase()).family(egui::FontFamily::Name("semibold".into())).size(11.5).color(t.dim));
+    ui.add_space(1.0);
+}
+
+fn with_alpha(c: Color32, a: u8) -> Color32 { Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a) }
+
+/// A square icon button for the tool strip.
+fn tool_button(ui: &mut egui::Ui, t: &Theme, selected: bool, tip: &str, icon: fn(&egui::Painter, Rect, Color32)) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::click());
+    let fill = if selected { t.accent } else if resp.hovered() { t.hover } else { Color32::TRANSPARENT };
+    ui.painter().rect_filled(rect, 8.0, fill);
+    icon(ui.painter(), rect.shrink(11.0), if selected || resp.hovered() { t.text } else { t.dim });
+    resp.on_hover_text(tip).clicked()
+}
+
+fn at_unit(r: Rect, x: f32, y: f32) -> Pos2 { Pos2::new(r.left() + x * r.width(), r.top() + y * r.height()) }
+
+fn icon_select(p: &egui::Painter, r: Rect, c: Color32) {
+    let pts = [(0.12, 0.0), (0.12, 0.84), (0.34, 0.64), (0.5, 1.0), (0.64, 0.94), (0.48, 0.58), (0.78, 0.56)];
+    p.add(Shape::closed_line(pts.iter().map(|&(x, y)| at_unit(r, x, y)).collect(), Stroke::new(1.6, c)));
+}
+fn icon_pen(p: &egui::Painter, r: Rect, c: Color32) {
+    let (a, b, d, e) = ((0.0f32, 0.95f32), (0.2, 0.1), (0.8, 0.95), (1.0, 0.08));
+    let pts: Vec<Pos2> = (0..=24).map(|i| { let t = i as f32 / 24.0; let u = 1.0 - t;
+        let x = u * u * u * a.0 + 3.0 * u * u * t * b.0 + 3.0 * u * t * t * d.0 + t * t * t * e.0;
+        let y = u * u * u * a.1 + 3.0 * u * u * t * b.1 + 3.0 * u * t * t * d.1 + t * t * t * e.1; at_unit(r, x, y) }).collect();
+    p.add(Shape::line(pts, Stroke::new(1.6, c)));
+    p.circle_filled(at_unit(r, a.0, a.1), 2.4, c);
+    p.circle_filled(at_unit(r, e.0, e.1), 2.4, c);
+}
+fn icon_transform(p: &egui::Painter, r: Rect, c: Color32) {
+    let b = Rect::from_min_max(at_unit(r, 0.08, 0.3), at_unit(r, 0.92, 1.0));
+    p.rect_stroke(b, 1.0, Stroke::new(1.4, c));
+    for k in [b.left_top(), b.right_top(), b.left_bottom(), b.right_bottom()] { p.rect_filled(Rect::from_center_size(k, Vec2::splat(4.5)), 1.0, c); }
+    let top = Pos2::new(b.center().x, b.top());
+    let knob = at_unit(r, 0.5, 0.02);
+    p.line_segment([top, Pos2::new(knob.x, knob.y + 2.5)], Stroke::new(1.4, c));
+    p.circle_stroke(knob, 2.5, Stroke::new(1.4, c));
+}
+fn icon_leaf(p: &egui::Painter, r: Rect, c: Color32) {
+    let (a, e) = (at_unit(r, 0.05, 0.95), at_unit(r, 0.95, 0.05));
+    let axis = e - a; let n = Vec2::new(-axis.y, axis.x).normalized();
+    let side = |s: f32| -> Vec<Pos2> { (0..=16).map(|i| { let t = i as f32 / 16.0; a + axis * t + n * s * (std::f32::consts::PI * t).sin().powf(0.8) * r.width() * 0.3 }).collect() };
+    let mut outline = side(1.0); let mut back = side(-1.0); back.reverse(); outline.extend(back);
+    p.add(Shape::closed_line(outline, Stroke::new(1.5, c)));
+    p.line_segment([a, a + axis * 0.8], Stroke::new(1.1, c));
+}
+
+/// A tiny scroll for the theme previews.
+fn mini_scroll(page: Rect) -> Vec<Pos2> {
+    let mut pts = vec![];
+    for i in 0..=20 { let t = i as f32 / 20.0; pts.push(at_unit(page, 0.08 + t * 0.55, 0.78 - (t * 1.6).sin() * 0.35)); }
+    let c = at_unit(page, 0.74, 0.42);
+    let start = *pts.last().unwrap();
+    let r0 = (start - c).length(); let a0 = (start.y - c.y).atan2(start.x - c.x);
+    for i in 1..=28 { let t = i as f32 / 28.0; let a = a0 + t * 5.2; let r = r0 * (1.0 - t * 0.72); pts.push(Pos2::new(c.x + a.cos() * r, c.y + a.sin() * r)); }
+    pts
+}
+
+fn family_label(f: Family) -> &'static str { match f { Family::Spiral => "Enclosing spiral", Family::Branching => "Branching scroll", Family::Border => "Rolling border", Family::Spray => "Flowing spray", Family::Fan => "Fan flourish" } }
+
+/// Library card thumbnail: the leaf grown from a short straight stem.
+fn draw_thumbnail(painter: &egui::Painter, rect: Rect, id: &str, ink: Color32) {
+    use scroll_core::growth::Kind;
+    let guide: Vec<Point> = (0..61).map(|i| pt(10.0 + i as f64 * 1.5, 92.0 - i as f64 * 1.3)).collect();
+    let parent = GrowthPart { id: "stem".into(), parent: None, kind: Kind::Primary, points: guide.clone(), polygon: guide.clone(), folds: vec![], ridges: None, cuts: vec![], length: 0.0, width: 1.0, birth: 0.0, duration: 1.0, contour_split: None, shoot: None, under: false };
+    let Some(mut params) = preset_params(id, 0.05, 1.0) else { return };
+    params.reach = if is_bud(id) { 0.35 } else { 0.8 };
+    if is_bud(id) { params.turn = 0.0; }
+    let leaf = scroll_core::shoots::grow_shoot(&guide, &parent, &params, "thumb", true);
+    let b = Bounds::of(&leaf.polygon); let s = (b.r - b.l).max(b.b - b.t).max(1e-6);
+    let map = |p: &Point| Pos2::new(rect.left() + ((p.x - b.l) / s) as f32 * rect.width() * 0.9 + rect.width() * 0.05, rect.top() + ((p.y - b.t) / s) as f32 * rect.height() * 0.9 + rect.height() * 0.05);
+    painter.add(Shape::closed_line(leaf.polygon.iter().map(map).collect(), Stroke::new(1.2, ink)));
+    for c in &leaf.cuts { painter.add(Shape::line(c.iter().map(map).collect(), Stroke::new(1.2, ink))); }
+    for f in &leaf.folds { painter.add(Shape::line(f.iter().map(map).collect(), Stroke::new(0.7, ink))); }
+}

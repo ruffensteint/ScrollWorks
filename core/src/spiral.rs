@@ -1,0 +1,98 @@
+//! Study 03 construction: the tail runs straight into the enclosing spiral;
+//! accent shoots share the rising sweep.
+use crate::contour::{acanthus_contour, root_flare, shoot_stalk, ContourOptions, Ends, GOLDEN_SMALL, MAIN_ENDS};
+use crate::geometry::{distance, line_frame, line_length, pt, Point};
+use crate::growth::{grow_curl, GrowthPart, GrowthResult, GrowthSettings, Kind, Mulberry, Page, Side};
+use crate::shoots::ShootParams;
+use std::f64::consts::PI;
+
+fn wrap(mut a: f64) -> f64 { while a > PI { a -= 2.0 * PI; } while a < -PI { a += 2.0 * PI; } a }
+
+fn band(points: Vec<Point>, width: f64, kind: Kind, id: &str, parent: Option<&str>, birth: f64) -> GrowthPart {
+    let (mut left, mut right) = (vec![], vec![]);
+    let n = points.len(); let length = line_length(&points);
+    for i in 0..n {
+        let t = i as f64 / (n as f64 - 1.0); let p = points[i];
+        let a = points[i.saturating_sub(1)]; let b = points[(i + 1).min(n - 1)];
+        let angle = (b.y - a.y).atan2(b.x - a.x); let (nx, ny) = (-angle.sin(), angle.cos());
+        let taper = (PI * t).sin().powf(0.7) * 1f64.min(((1.0 - t) / 0.23).powi(2));
+        let lobe = 0.3; let tip = 1f64.min(((1.0 - t) / 0.15).powi(2));
+        let prev = points[i.saturating_sub(2)]; let next = points[(i + 2).min(n - 1)];
+        let turn = wrap((next.y - p.y).atan2(next.x - p.x) - (p.y - prev.y).atan2(p.x - prev.x));
+        let radius = distance(prev, next) / (2.0 * 0.001f64.max(turn.abs()));
+        let mut clearance = f64::INFINITY;
+        for j in 0..n { if (j as isize - i as isize).abs() > 35 { clearance = clearance.min(distance(p, points[j]) * 0.42); } }
+        let cap = 0.02f64.max((radius * 0.55).min(clearance));
+        let outer = cap.min(width * (0.035 + 0.20 * taper) * tip); let inner = cap.min(width * (0.035 + taper * lobe) * tip);
+        left.push(pt(p.x + nx * outer, p.y + ny * outer)); right.push(pt(p.x - nx * inner, p.y - ny * inner));
+    }
+    right.reverse(); left.extend(right);
+    GrowthPart { id: id.into(), parent: parent.map(|s| s.to_string()), kind, points, polygon: left, folds: vec![], ridges: None, cuts: vec![], width, length, birth, duration: if kind == Kind::Primary { 0.52 } else { 0.25 }, contour_split: None, shoot: None, under: false }
+}
+
+pub fn spiral_anatomy(page: &Page, s: &GrowthSettings) -> GrowthResult {
+    let mut rand = Mulberry(s.seed);
+    let guide = page.guide(); let guide_length = line_length(&guide);
+    let free = s.free == Some(true);
+    let in_page = |pts: &[Point]| free || pts.iter().all(|p| p.x >= 2.0 && p.y >= 2.0 && p.x <= page.width - 2.0 && p.y <= page.height - 2.0);
+    let mirror = if s.flip == Some(true) { -1.0 } else { 1.0 };
+    let (tp, ta) = line_frame(&guide, 1.0);
+    let preferred = (if s.side == Side::Right { 1.0 } else { -1.0 }) * mirror;
+    let mut ending: Vec<Point> = vec![]; let mut terminal_side = preferred;
+    // Wrapping leaves need open space inside the curl: a larger, looser volute.
+    let wrapped_curl = s.wraps.unwrap_or(0) > 0;
+    let (reach_gain, curl) = if wrapped_curl { (1.55, 0.86) } else { (1.0, 0.95) };
+    let mut main_reach = (guide_length * (1.0 - GOLDEN_SMALL) * GOLDEN_SMALL).min(36.0) * reach_gain;
+    for side in [preferred, -preferred] {
+        if !ending.is_empty() { break; }
+        let mut scale = 1.0;
+        while scale >= 0.15 {
+            let p = grow_curl(tp, ta, main_reach * scale, curl, side);
+            if in_page(&p) { ending = p; terminal_side = side; main_reach *= scale; break; }
+            scale -= 0.1;
+        }
+    }
+    let mut spine = guide.clone(); if ending.len() > 1 { spine.extend_from_slice(&ending[1..]); }
+    let mut parts = vec![band(spine, (guide_length * 0.045).min(7.3), Kind::Primary, "spiral", None, 0.0)];
+    let count = if s.levels == 2 { 3 } else { 1 }; let secondary_scale = s.secondary_scale.unwrap_or(1.0);
+    for i in 0..count {
+        let progress = [(1.0 - GOLDEN_SMALL) * GOLDEN_SMALL, 1.0 - GOLDEN_SMALL, GOLDEN_SMALL][i];
+        let (fp, fa) = line_frame(&guide, progress); let side = (if i == 1 { -1.0 } else { 1.0 }) * mirror;
+        let reach = main_reach / reach_gain * [GOLDEN_SMALL.powi(2), GOLDEN_SMALL.powi(3), GOLDEN_SMALL][i] * (0.97 + rand.next() * 0.06) * secondary_scale;
+        let mut shoot = grow_curl(fp, fa, reach, 0.66, side); let mut used = (reach, side);
+        let mut k = 0;
+        while k < 8 && !in_page(&shoot) { used = (reach * (0.8 - k as f64 * 0.08), -side); shoot = grow_curl(fp, fa, used.0, 0.66, used.1); k += 1; }
+        if !in_page(&shoot) { continue; }
+        let mut part = band(shoot, (if i == 2 { 5.6 } else { 4.5 }) * secondary_scale, Kind::Secondary, &format!("shoot-{i}"), Some("spiral"), 0.20 + i as f64 * 0.11);
+        part.shoot = Some(ShootParams { progress, reach: used.0 / guide_length, turn: 0.0, curl: 0.66, side: used.1, ..ShootParams::default() });
+        parts.push(part);
+    }
+    if s.sweeps == Some(2) {
+        let (fp, fa) = line_frame(&guide, 0.35);
+        let r = (guide_length * 0.1).min(16.0) * secondary_scale;
+        let p = grow_curl(fp, fa, r, 0.85, -mirror);
+        if in_page(&p) { let mut part = band(p, 4.5, Kind::Primary, "companion", Some("spiral"), 0.18); part.shoot = Some(ShootParams { progress: 0.35, reach: r / guide_length, turn: 0.0, curl: 0.85, side: -mirror, ..ShootParams::default() }); parts.push(part); }
+    }
+    // Contours: the main keeps its lobes turning into the eye; shoots carry
+    // their leaf on the convex side of the curl.
+    let n = parts.len();
+    for idx in 0..n {
+        let is_main = idx == 0;
+        let (points, width, length) = (parts[idx].points.clone(), parts[idx].width, parts[idx].length);
+        let turn = wrap(line_frame(&points, 0.55).1 - line_frame(&points, 0.15).1);
+        let sign = if turn > 0.0 { 1.0 } else if turn < 0.0 { -1.0 } else { 0.0 };
+        let side = if is_main { terminal_side } else { -(if sign != 0.0 { sign } else { terminal_side }) };
+        let leaf_width = if is_main { main_reach * GOLDEN_SMALL / reach_gain } else { length * (1.0 - GOLDEN_SMALL) * GOLDEN_SMALL };
+        // A backbone growing from another stem starts narrow and flares out
+        // of it like a leaf root, instead of starting blunt.
+        let attached = is_main && s.attach.is_some();
+        let root_width = if attached { 2f64.min(width * 0.45) * 0.9 } else if is_main { 0.0 } else { root_flare(&parts[0].polygon, points[0], leaf_width) };
+        let o = ContourOptions { start: if is_main { guide_length / length * GOLDEN_SMALL } else { 0.0 }, belly: if is_main { GOLDEN_SMALL } else { 0.0 }, lobed: s.leaves > 0, root_width, stalk: if is_main { 0.0 } else { shoot_stalk() }, ends: if attached { Some(Ends { start: 0.2, tip: MAIN_ENDS.tip }) } else if is_main { Some(MAIN_ENDS) } else { None }, ..ContourOptions::default() };
+        let a = acanthus_contour(&points, 2f64.min(width * 0.45), side, leaf_width, &o);
+        let p = &mut parts[idx];
+        p.polygon = a.polygon; p.folds = a.folds; p.ridges = Some(a.ridges); p.contour_split = Some(241);
+        if let Some(sh) = p.shoot.as_mut() { sh.stem = Some(2f64.min(width * 0.45)); sh.leaf_side = Some(side); }
+    }
+    let accents = parts.iter().filter(|p| p.kind == Kind::Secondary).count();
+    GrowthResult { parts, skipped: 0, attempts: 0, message: format!("Curve-grown backbone · {accents} accent shoots") }
+}

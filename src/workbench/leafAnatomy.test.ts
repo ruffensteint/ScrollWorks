@@ -1,5 +1,0 @@
-import {it,expect} from 'vitest';
-import {generateGrowth,defaultGrowth} from './growth';
-import {initialLayout} from './model';
-it('keeps the same outer sweep and substantial body with leaves disabled',()=>{const d=initialLayout(),bare=generateGrowth(d,{...defaultGrowth,leaves:0}),full=generateGrowth(d);const area=(p:{x:number,y:number}[])=>Math.abs(p.reduce((sum,a,i)=>{const b=p[(i+1)%p.length];return sum+a.x*b.y-a.y*b.x;},0)/2);for(let i=0;i<bare.parts.length;i++){expect(bare.parts[i].polygon.slice(0,241)).toEqual(full.parts[i].polygon.slice(0,241));expect(area(bare.parts[i].polygon)).toBeGreaterThan(area(full.parts[i].polygon)*.7);expect(bare.parts[i].folds).toHaveLength(0);}});
-it('constructs leaf returns on the shared spine without separate leaf stamps',()=>{const d=initialLayout(),bare=generateGrowth(d,{...defaultGrowth,leaves:0}),full=generateGrowth(d);expect(full.parts.map(p=>p.points)).toEqual(bare.parts.map(p=>p.points));expect(full.parts.some(p=>p.kind==='leaf')).toBe(false);expect(full.parts.every(p=>p.folds.length===2)).toBe(true);expect(full.parts[0].polygon).not.toEqual(bare.parts[0].polygon);});

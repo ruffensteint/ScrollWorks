@@ -1,23 +1,39 @@
 # ScrollWorks
 
-A browser-based carving design tool built with TypeScript, React and SVG. Generate scrollwork from editable backbones, compose chip-carving patterns, place leaf shapes, save local presets and export designs at physical millimeter sizes. Generation runs locally without AI API calls.
+A desktop carving design tool for Windows, written in Rust. Generate acanthus scrollwork from editable backbones, compose chip-carving patterns, place library leaves and buds, and export designs as SVG at physical millimetre sizes. All generation runs locally, with no AI services and no network access.
 
-## Run locally
+## Features
 
-Use Node.js 22.12 or later and pnpm 10.
+- **Scroll workspace:** grown sweeps and acanthus leaves on editable backbones, with Select (V), Pen (P) and Move/Transform (T) tools.
+  - **Construction picker:** single scroll, parent and child, S-scroll, mirrored pair, running border, point of origin and corner, each with seeded variations.
+  - **Backbones grown from other backbones:** they join like a leaf root and move with their parent.
+  - **Library:** measured leaf types, terminal buds (husk, trefoil, berry cluster) and saved presets.
+  - **Wrapping leaves** laid into a scroll's curl, either generated or taken from the library.
+  - **Follow stem**, which bends a placed leaf along the stem it grows from.
+  - **Layers and carving guides:** over/under layering and carving guides.
+- **Chip workspace:** a chip-carving pattern generator with its own preset library.
+- **Themes:** Graphite (default), Midnight, Slate, Studio, Paper and Sage.
 
-```sh
-pnpm install --frozen-lockfile
-pnpm dev
-pnpm test
-pnpm build
-```
+Layouts save as `.scrollworks` or `.json`, the same format as the earlier browser edition. Old stamped motifs are converted to grown leaves.
 
-Each backbone has its own growth family, sweep count, structure and variation seed. The chip editor supports a millimeter grid and simplified curve handles. Presets stay in browser storage; export backups for portability.
+## Build
 
-## Python ports
+1. Install Rust from https://rustup.rs.
+2. Run `Build ScrollWorks.cmd`. It writes `build-log.txt` and `ScrollWorks.exe`. The first build downloads libraries and takes several minutes.
+3. Run `Test geometry.cmd` for the geometry tests; results go to `test-log.txt`.
 
-See CONTRIBUTING.md for the geometry entry points. The generator is procedural; reference raster images are not needed at runtime and are intentionally excluded from this source release.
+On other platforms, use `cargo build --release -p scrollworks` and `cargo test --release -p scroll_core`.
+
+## Layout
+
+- `core/` (`scroll_core`, no dependencies): backbones, grown sweeps, acanthus and library leaves, buds, skeletons, wrapping leaves, joins, layering, carving guides, transforms, chip patterns and SVG export. `tests/` includes golden comparisons against the browser edition's output.
+- `app/` (`scrollworks`): the egui desktop program, with menus, tools, canvas, panels, themes, the chip workspace and presets.
+
+Settings and presets are stored in `%APPDATA%\ScrollWorks`.
+
+## Browser edition
+
+The earlier TypeScript/React browser edition is retired. Its source remains in this repository's history, up to commit `e7715db`.
 
 ## License and attribution
 
@@ -25,11 +41,4 @@ Project-authored software is licensed under GPL-3.0-only. See LICENSE, COPYING.m
 
 ## Limitations
 
-Leaf anatomy and collision handling remain works in progress. Review joins, overlaps and print scaling before carving. Scroll exports are drawing outlines, not machining toolpaths. Passing tests does not certify visual quality.
-
-## Release preparation
-
-The public snapshot is prepared with `node scripts/prepare-source-release.mjs`. It excludes private hosting metadata, existing Git history, references and personal designs. See RELEASE_AUDIT.md for the review record.
-
-The GitHub source release is a browser-only edition: it has no app-install button, PWA manifest, or offline service worker.
-
+Leaf anatomy and collision handling are still being worked on. Review joins, overlaps and print scaling before carving. Scroll exports are drawing outlines, not machining toolpaths. Passing tests does not certify visual quality.

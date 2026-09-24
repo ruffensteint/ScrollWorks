@@ -1,10 +1,8 @@
-node_modules/
-dist/
-.vite/
-*.tsbuildinfo
-.env*
-*.local
+target/
+build-log.txt
+test-log.txt
+ScrollWorks.exe
+*.scrollworks
 references/
 layouts/
-.openai/
-release-source/
+.env*
