@@ -21,19 +21,27 @@ pub struct Drawing { pub outline: Runs, pub folds: Runs }
 
 /// Normal view and SVG export.
 pub fn layered_drawing(result: &GrowthResult) -> Drawing {
+    let (mut outline, mut folds) = (vec![], vec![]);
+    for d in layered_parts(result) { outline.extend(d.outline); outline.extend(d.cuts); folds.extend(d.folds); }
+    Drawing { outline, folds }
+}
+
+/// One part's visible lines in the classic drawing.
+pub struct PartLines { pub outline: Runs, pub cuts: Runs, pub folds: Runs }
+
+/// The classic drawing, part by part (in drawing order).
+pub fn layered_parts(result: &GrowthResult) -> Vec<PartLines> {
     let parts = &result.parts;
     let zones: Vec<Option<Vec<Point>>> = parts.iter().map(|p| parts.iter().find(|q| Some(&q.id) == p.parent.as_ref()).map(|par| join_zone(p, par))).collect();
-    let (mut outline, mut folds) = (vec![], vec![]);
+    let mut out = vec![];
     for (index, part) in parts.iter().enumerate() {
         let covers: Vec<&[Point]> = parts[index + 1..].iter().map(|p| p.polygon.as_slice()).collect();
         let mut joins: Vec<Join> = vec![];
         if let Some(parent) = parts.iter().find(|q| Some(&q.id) == part.parent.as_ref()) { joins.push(Join { collar: zones[index].as_ref().unwrap(), stems: vec![&parent.polygon] }); }
         for (ci, child) in parts[..index].iter().enumerate() { if child.parent.as_ref() == Some(&part.id) { joins.push(Join { collar: zones[ci].as_ref().unwrap(), stems: vec![&child.polygon] }); } }
-        outline.extend(visible_lines(&[closed(&part.polygon)], &covers, &joins));
-        outline.extend(visible_lines(&part.cuts, &covers, &joins));
-        folds.extend(visible_lines(&part.folds, &covers, &joins));
+        out.push(PartLines { outline: visible_lines(&[closed(&part.polygon)], &covers, &joins), cuts: visible_lines(&part.cuts, &covers, &joins), folds: visible_lines(&part.folds, &covers, &joins) });
     }
-    Drawing { outline, folds }
+    out
 }
 
 pub struct Guides { pub outline: Runs, pub creases: Runs, pub ridges: Runs }

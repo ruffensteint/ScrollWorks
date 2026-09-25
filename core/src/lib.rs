@@ -1,5 +1,5 @@
 //! ScrollWorks core: procedural acanthus scroll geometry for carving patterns.
-//! No dependencies; used by the native desktop app.
+//! Used by the native desktop app; the only dependency is i_overlay (exact booleans).
 pub mod geometry;
 pub mod outline;
 pub mod contour;
@@ -16,3 +16,6 @@ pub mod bud;
 pub mod skeleton;
 pub mod wraps;
 pub mod collar;
+pub mod joins;
+pub mod booleans;
+pub mod exact;

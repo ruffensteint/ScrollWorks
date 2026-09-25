@@ -139,8 +139,12 @@ impl Layout {
         all
     }
     /// The pattern SVG at physical millimetre size.
-    pub fn svg(&self) -> String {
-        let d = layered_drawing(&self.grow());
+    pub fn svg(&self) -> String { self.svg_with(false) }
+    /// The pattern SVG, drawn with smooth filleted joins when `smooth`.
+    pub fn svg_with(&self, smooth: bool) -> String { self.svg_joins(if smooth { JoinStyle::Smooth } else { JoinStyle::Classic }) }
+    /// The pattern SVG with the given root joins.
+    pub fn svg_joins(&self, joins: JoinStyle) -> String {
+        let d = joins.draw(&self.grow());
         let backbone = if self.print_backbone { self.curves.iter().map(|c| format!("<path d=\"M {} {} C {} {} {} {} {} {}\" stroke-width=\".35\"/>", c[0].x, c[0].y, c[1].x, c[1].y, c[2].x, c[2].y, c[3].x, c[3].y)).collect::<String>() } else { String::new() };
         format!("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}mm\" height=\"{h}mm\" viewBox=\"0 0 {w} {h}\"><title>ScrollWorks pattern</title><g fill=\"none\" stroke=\"#000\" stroke-linecap=\"round\" stroke-linejoin=\"round\">{backbone}<path d=\"{}\" stroke-width=\".35\"/><path d=\"{}\" stroke-width=\".2\"/></g></svg>", path_data(&d.outline, false), path_data(&d.folds, false), w = self.width, h = self.height)
     }
@@ -148,6 +152,26 @@ impl Layout {
     pub fn carving_svg(&self) -> String {
         let g = carving_guides(&self.grow());
         format!("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}mm\" height=\"{h}mm\" viewBox=\"0 0 {w} {h}\"><title>ScrollWorks suggested carving guides</title><desc>Solid black: visible edges. Blue dashed: suggested raised ridges. Red dotted: recessed creases. Review before carving; not routing toolpaths.</desc><g fill=\"none\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path id=\"visible-edges\" d=\"{}\" stroke=\"black\" stroke-width=\".35\"/><path id=\"raised-ridges\" d=\"{}\" stroke=\"#246a9b\" stroke-width=\".25\" stroke-dasharray=\"2 1\"/><path id=\"recessed-creases\" d=\"{}\" stroke=\"#a24434\" stroke-width=\".25\" stroke-dasharray=\".4 .8\"/></g></svg>", path_data(&g.outline, false), path_data(&g.ridges, false), path_data(&g.creases, false), w = self.width, h = self.height)
+    }
+}
+
+/// How roots are drawn where a part grows from its parent.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum JoinStyle {
+    /// Both outlines cut away inside a small circle (the golden-tested engine).
+    Classic,
+    /// Signed-distance blend around roots (`joins`).
+    Smooth,
+    /// Exact booleans: tidied outlines and round fillets of this radius in mm (`exact`).
+    Exact(f64),
+}
+impl JoinStyle {
+    pub fn draw(self, g: &GrowthResult) -> crate::layers::Drawing {
+        match self {
+            JoinStyle::Classic => layered_drawing(g),
+            JoinStyle::Smooth => crate::joins::smooth_drawing(g),
+            JoinStyle::Exact(fillet) => crate::exact::exact_drawing(g, crate::exact::ExactSettings { tidy: true, fillet }),
+        }
     }
 }
 

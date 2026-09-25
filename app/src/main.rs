@@ -20,7 +20,7 @@ use scroll_core::profiles::profile;
 use scroll_core::shoots::{drag_tip, nearest_progress, tip_handle, ShootEdit, ShootParams};
 use scroll_core::transform::{flip_curve, mirror_shoot, transform_curve, Axis, TransformKind};
 use std::path::PathBuf;
-use theme::{Canvas, Prefs, Theme, ThemeId};
+use theme::{Canvas, Joins, Prefs, Theme, ThemeId};
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -65,6 +65,8 @@ struct App {
     // cached growth and drawings
     grown: GrowthResult,
     drawing: Drawing,
+    /// The shown drawing is the quick classic one; redraw smooth when idle.
+    smooth_due: bool,
     guides: Option<Guides>,
     stale: bool,
     // view: screen = origin + mm * zoom
@@ -84,6 +86,8 @@ struct App {
     applied: Option<Prefs>,
     /// Interface size while its slider is being dragged.
     scale_draft: f32,
+    /// Fillet slider value while it is being dragged (applied on release).
+    fillet_draft: f32,
     workspace: Workspace,
     chip: chip_ui::ChipState,
     scroll_presets: presets::Library,
@@ -100,7 +104,7 @@ impl App {
         let prefs = Prefs::load();
         let layout = Layout::starter();
         let mut app = App { layout, path: None, dirty: false, past: vec![], future: vec![], tool: Tool::Select, tab: Tab::Properties, backbone: 0, selected: None, carving: false, show_guides: true, grid: false,
-            grown: GrowthResult::default(), drawing: Drawing { outline: vec![], folds: vec![] }, guides: None, stale: true, zoom: 3.0, origin: Pos2::ZERO, fitted: false, drag: None, drag_before: None, message: String::new(), cursor_mm: None, shown_title: String::new(), pending: None, allow_close: false, prefs, applied: None, scale_draft: prefs.ui_scale,
+            grown: GrowthResult::default(), drawing: Drawing { outline: vec![], folds: vec![] }, smooth_due: false, guides: None, stale: true, zoom: 3.0, origin: Pos2::ZERO, fitted: false, drag: None, drag_before: None, message: String::new(), cursor_mm: None, shown_title: String::new(), pending: None, allow_close: false, prefs, applied: None, scale_draft: prefs.ui_scale, fillet_draft: prefs.fillet,
             workspace: if prefs.chip { Workspace::Chip } else { Workspace::Scroll }, chip: chip_ui::ChipState::new(), scroll_presets: presets::Library::load("scroll-presets.json"), scroll_thumbs: vec![], skeleton: None, skel_seed: 0, skel_thumbs: vec![None; Skeleton::ALL.len()] };
         app.regrow();
         app
@@ -110,7 +114,11 @@ impl App {
     fn regrow(&mut self) {
         let mut rounds = 0; while rounds < 6 && self.layout.settle() { rounds += 1; }
         self.grown = self.layout.grow();
-        self.drawing = layered_drawing(&self.grown);
+        // Smooth and exact joins take a little longer, so while something is
+        // being dragged the classic drawing is shown and theirs follows on release.
+        let slow = self.prefs.joins != Joins::Classic;
+        self.drawing = if slow && self.drag.is_none() { self.prefs.join_style().draw(&self.grown) } else { layered_drawing(&self.grown) };
+        self.smooth_due = slow && self.drag.is_some();
         self.guides = if self.carving { Some(carving_guides(&self.grown)) } else { None };
         self.stale = false;
     }
@@ -245,7 +253,7 @@ impl App {
         match std::fs::write(&path, io::save(&self.layout)) { Ok(()) => { self.path = Some(path); self.dirty = false; self.message = "Saved.".into(); } Err(e) => self.message = format!("Could not save: {e}") }
     }
     fn export(&mut self, carving: bool) {
-        let (name, svg) = if carving { ("carving-guides.svg", self.layout.carving_svg()) } else { ("pattern.svg", self.layout.svg()) };
+        let (name, svg) = if carving { ("carving-guides.svg", self.layout.carving_svg()) } else { ("pattern.svg", self.layout.svg_joins(self.prefs.join_style())) };
         if let Some(p) = rfd::FileDialog::new().add_filter("SVG", &["svg"]).set_file_name(name).save_file() {
             match std::fs::write(&p, svg) { Ok(()) => self.message = format!("Exported {}.", p.display()), Err(e) => self.message = format!("Could not export: {e}") }
         }
@@ -720,6 +728,17 @@ impl App {
         let mut white = self.prefs.white_page;
         if ui.add_enabled(dark_page, egui::Checkbox::new(&mut white, "Show the page as white paper")).changed() { self.set_prefs(Prefs { white_page: white, ..self.prefs }); }
         ui.label(egui::RichText::new(if dark_page { "Keeps the dark interface but previews the pattern as it will print." } else { "This theme already shows a light page." }).small().color(t.dim));
+        ui.label("Root joins");
+        let mut joins = self.prefs.joins;
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut joins, Joins::Exact, "Exact").on_hover_text("Tidies tangled outlines, and rounds the crotch where a leaf or branch grows from its stem with a true fillet.");
+            ui.radio_value(&mut joins, Joins::Smooth, "Smooth").on_hover_text("The earlier soft blend around roots.");
+            ui.radio_value(&mut joins, Joins::Classic, "Classic").on_hover_text("Both outlines simply cut away at the root.");
+        });
+        if joins != self.prefs.joins { self.set_prefs(Prefs { joins, ..self.prefs }); self.stale = true; }
+        let resp = ui.add_enabled(joins == Joins::Exact, egui::Slider::new(&mut self.fillet_draft, 0.3..=1.5).text("Fillet").custom_formatter(|v, _| format!("{v:.1} mm")).step_by(0.1));
+        // redrawing takes a moment, so apply on release
+        if resp.drag_stopped() || (resp.changed() && !resp.dragged()) { self.set_prefs(Prefs { fillet: self.fillet_draft, ..self.prefs }); self.stale = true; }
         section(ui, t, "Interface size");
         let resp = ui.add(egui::Slider::new(&mut self.scale_draft, 0.8..=1.5).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)).step_by(0.05));
         // Rescaling mid-drag would move the slider under the pointer, so apply on release.
@@ -880,6 +899,7 @@ impl App {
                 if !matches!(self.drag, Some(Drag::Pan)) { self.past.push(before); self.future.clear(); self.dirty = true; }
             }
             self.drag = None; self.drag_before = None;
+            if self.smooth_due { self.stale = true; }
         }
         if resp.clicked() && self.tool == Tool::Select {
             if let Some(pos) = pointer { let mm = self.to_mm(pos); self.selected = self.hit_leaf(mm); }

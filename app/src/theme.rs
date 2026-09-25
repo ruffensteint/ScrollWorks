@@ -179,9 +179,29 @@ pub fn install_fonts(ctx: &egui::Context) {
 /// Preferences kept between sessions, in %APPDATA%\ScrollWorks\settings.txt.
 #[derive(Clone, Copy, PartialEq)]
 pub struct Prefs { pub theme: ThemeId, pub white_page: bool, pub ui_scale: f32, /// Last workspace was Chip.
-    pub chip: bool }
+    pub chip: bool,
+    /// How roots are drawn: "classic", "smooth" or "exact".
+    pub joins: Joins,
+    /// Fillet radius in mm for exact joins.
+    pub fillet: f32 }
 
-impl Default for Prefs { fn default() -> Self { Prefs { theme: ThemeId::Graphite, white_page: false, ui_scale: 1.0, chip: false } } }
+/// The root-join drawing engine chosen in the Canvas settings.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Joins { Classic, Smooth, Exact }
+impl Joins {
+    pub fn key(self) -> &'static str { match self { Joins::Classic => "classic", Joins::Smooth => "smooth", Joins::Exact => "exact" } }
+    pub fn from_key(k: &str) -> Option<Joins> { match k { "classic" => Some(Joins::Classic), "smooth" => Some(Joins::Smooth), "exact" => Some(Joins::Exact), _ => None } }
+}
+
+impl Default for Prefs { fn default() -> Self { Prefs { theme: ThemeId::Graphite, white_page: false, ui_scale: 1.0, chip: false, joins: Joins::Exact, fillet: 0.8 } } }
+
+impl Prefs {
+    /// The core join style these preferences ask for.
+    pub fn join_style(&self) -> scroll_core::model::JoinStyle {
+        use scroll_core::model::JoinStyle;
+        match self.joins { Joins::Classic => JoinStyle::Classic, Joins::Smooth => JoinStyle::Smooth, Joins::Exact => JoinStyle::Exact(self.fillet as f64) }
+    }
+}
 
 fn prefs_path() -> Option<PathBuf> {
     let base = std::env::var_os("APPDATA").or_else(|| std::env::var_os("HOME")).map(PathBuf::from)?;
@@ -198,6 +218,8 @@ impl Prefs {
                 "theme" => if let Some(t) = ThemeId::from_key(v.trim()) { p.theme = t; },
                 "white_page" => p.white_page = v.trim() == "true",
                 "workspace" => p.chip = v.trim() == "chip",
+                "joins" => if let Some(j) = Joins::from_key(v.trim()) { p.joins = j; },
+                "fillet" => if let Ok(r) = v.trim().parse::<f32>() { p.fillet = r.clamp(0.3, 1.5); },
                 "ui_scale" => if let Ok(s) = v.trim().parse::<f32>() { p.ui_scale = s.clamp(0.8, 1.5); },
                 _ => {}
             }
@@ -207,6 +229,6 @@ impl Prefs {
     pub fn save(&self) {
         let Some(f) = prefs_path() else { return };
         if let Some(dir) = f.parent() { let _ = std::fs::create_dir_all(dir); }
-        let _ = std::fs::write(f, format!("theme={}\nwhite_page={}\nui_scale={:.2}\nworkspace={}\n", self.theme.key(), self.white_page, self.ui_scale, if self.chip { "chip" } else { "scroll" }));
+        let _ = std::fs::write(f, format!("theme={}\nwhite_page={}\nui_scale={:.2}\nworkspace={}\njoins={}\nfillet={:.2}\n", self.theme.key(), self.white_page, self.ui_scale, if self.chip { "chip" } else { "scroll" }, self.joins.key(), self.fillet));
     }
 }

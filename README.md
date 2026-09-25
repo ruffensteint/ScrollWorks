@@ -12,6 +12,7 @@ A desktop carving design tool for Windows, written in Rust. Generate acanthus sc
   - **Follow stem**, which bends a placed leaf along the stem it grows from.
   - **Leaf fans:** two or three leaves from one node, sized 100 / 66 / 33.
   - **Layers and carving guides:** over/under layering and carving guides.
+  - **Root joins** (Canvas settings): *Exact* rounds the crotch where a leaf or branch grows from its stem with a true fillet (adjustable radius) and tidies tangled outlines; *Smooth* and *Classic* are the earlier styles.
 - **Chip workspace:** a chip-carving pattern generator with its own preset library.
 - **Themes:** Graphite (default), Midnight, Slate, Studio, Paper and Sage.
 
@@ -27,7 +28,7 @@ On other platforms, use `cargo build --release -p scrollworks` and `cargo test -
 
 ## Layout
 
-- `core/` (`scroll_core`, no dependencies): backbones, grown sweeps, acanthus and library leaves, buds, skeletons, wrapping leaves, joins, layering, carving guides, transforms, chip patterns and SVG export. `tests/` includes golden comparisons against the browser edition's output.
+- `core/` (`scroll_core`; one dependency, i_overlay, for exact polygon booleans): backbones, grown sweeps, acanthus and library leaves, buds, skeletons, wrapping leaves, joins, layering, carving guides, transforms, chip patterns and SVG export. `tests/` includes golden comparisons against the browser edition's output.
 - `app/` (`scrollworks`): the egui desktop program, with menus, tools, canvas, panels, themes, the chip workspace and presets.
 
 Settings and presets are stored in `%APPDATA%\ScrollWorks`.
@@ -38,7 +39,7 @@ The earlier TypeScript/React browser edition is retired. Its source remains in t
 
 ## License and attribution
 
-Project-authored software is licensed under GPL-3.0-only. See LICENSE, COPYING.md, THIRD_PARTY_NOTICES.md and BRANDING.md. Modified distributions must meet the applicable GPL source and notice requirements. Ruffensteint branding does not imply endorsement of forks.
+Project-authored software is licensed under GPL-3.0-only. See LICENSE, COPYING.md, THIRD_PARTY_NOTICES.md and BRANDING.md. THIRD_PARTY_LICENSES.md lists every crate compiled into ScrollWorks.exe with its license text, and ships with any distributed executable. Modified distributions must meet the applicable GPL source and notice requirements. Ruffensteint branding does not imply endorsement of forks.
 
 ## Limitations
 
