@@ -23,7 +23,7 @@ pub fn bud_params(id: &str, progress: f64, side: f64) -> Option<ShootParams> {
 }
 
 /// Centripetal Catmull-Rom through closed control points: soft, even curves.
-fn smooth(ctrl: &[(f64, f64)], per: usize) -> Vec<Point> {
+pub(crate) fn smooth(ctrl: &[(f64, f64)], per: usize) -> Vec<Point> {
     let p: Vec<Point> = ctrl.iter().map(|&(x, y)| pt(x, y)).collect();
     let m = p.len(); let mut out = vec![];
     for i in 0..m {
@@ -40,7 +40,7 @@ fn smooth(ctrl: &[(f64, f64)], per: usize) -> Vec<Point> {
     }
     out
 }
-fn open(ctrl: &[(f64, f64)]) -> Vec<Point> {
+pub(crate) fn open(ctrl: &[(f64, f64)]) -> Vec<Point> {
     // open curve: pad the ends so the spline passes through the first and last points
     let mut c = vec![ctrl[0]]; c.extend_from_slice(ctrl); c.push(*ctrl.last().unwrap());
     let closed = smooth(&c, 10);

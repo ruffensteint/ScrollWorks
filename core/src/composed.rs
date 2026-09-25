@@ -17,8 +17,11 @@ pub fn composed_growth(page: &Page, s: &GrowthSettings) -> GrowthResult {
     let flip = if s.flip == Some(true) { -1.0 } else { 1.0 };
     let open_family = matches!(family, Family::Spray | Family::Fan | Family::Border);
     if open_family {
-        let ends = if s.attach.is_some() { Ends { start: 0.2, tip: OPEN_ENDS.tip } } else { OPEN_ENDS };
-        let o = ContourOptions { lobed: false, notches: leaf_notches(), ends: Some(ends), ..ContourOptions::default() };
+        // an attached stem flares out of its parent (wider under a collar)
+        // and keeps real width past the flare instead of pinching
+        let collar = s.attach.and(s.collar).filter(|c| c.is_finite() && *c > 0.0);
+        let (ends, root_width) = match (s.attach.is_some(), collar) { (true, Some(c)) => (OPEN_ENDS, 2.6 * c.clamp(0.6, 1.6)), (true, None) => (Ends { start: 0.8, tip: OPEN_ENDS.tip }, 1.4), _ => (OPEN_ENDS, 0.0) };
+        let o = ContourOptions { lobed: false, notches: leaf_notches(), ends: Some(ends), root_width, ..ContourOptions::default() };
         let a = acanthus_contour(&guide, 1.5, (if s.side == Side::Right { 1.0 } else { -1.0 }) * flip, length * if family == Family::Fan { 0.035 } else { 0.012 }, &o);
         main.points = guide.clone(); main.length = length; main.polygon = a.polygon; main.folds = vec![]; main.ridges = Some(vec![]); main.contour_split = Some(241);
     }

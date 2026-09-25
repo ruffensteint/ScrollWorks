@@ -7,6 +7,30 @@ use crate::outline::path_data;
 use crate::profiles::profile;
 use crate::shoots::{ShootEdit, ShootParams};
 
+/// Pull a child sweep's root outline back inside its parent near the join
+/// (see `grow_settled`).
+fn tuck_root(child: &mut GrowthPart, parent: &[Point], join: Point) {
+    use crate::outline::inside;
+    let spine = &child.points; if spine.len() < 4 { return; }
+    let start = if distance(spine[0], join) <= distance(*spine.last().unwrap(), join) { spine[0] } else { *spine.last().unwrap() };
+    let Some(ahead) = spine.iter().copied().filter(|q| distance(*q, start) > 6.0).min_by(|a, b| distance(*a, start).partial_cmp(&distance(*b, start)).unwrap()) else { return };
+    let l = distance(ahead, start).max(1e-9); let d = pt((ahead.x - start.x) / l, (ahead.y - start.y) / l);
+    let reach = 9.0;
+    for p in child.polygon.iter_mut() {
+        let (dx, dy) = (p.x - join.x, p.y - join.y);
+        let ahead = dx * d.x + dy * d.y;
+        if dx.hypot(dy) > reach || ahead > 3.0 || inside(*p, parent) { continue; }
+        // largest k in (0, 1) with join + k·(p − join) inside the parent
+        let (mut lo, mut hi) = (0.0, 1.0);
+        for _ in 0..24 { let k = (lo + hi) / 2.0; if inside(pt(join.x + dx * k, join.y + dy * k), parent) { lo = k; } else { hi = k; } }
+        // fully tucked behind the fork, easing out toward the child so the
+        // outline has no step where tucking stops
+        let w = { let x = ((3.0 - ahead) / 3.0).clamp(0.0, 1.0); x * x * (3.0 - 2.0 * x) };
+        let k = 1.0 + (lo * 0.8 - 1.0) * w;
+        *p = pt(join.x + dx * k, join.y + dy * k);
+    }
+}
+
 /// Old manual-mode stamp; kept only so saved layouts can be converted.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Placement { pub id: String, pub motif: String, pub progress: f64, pub length: f64, pub fullness: f64, pub angle: f64, pub bend: f64, pub mirror: bool, pub folds: bool, pub backbone: usize, pub on_top: Option<bool> }
@@ -92,7 +116,25 @@ impl Layout {
         for i in 0..self.curves.len() {
             let Some(parent) = self.growth_for(i).attach.filter(|&p| p != i && p < self.curves.len()) else { continue };
             let (Some(child), Some(pid)) = (mains[i].clone(), mains[parent].clone()) else { continue };
-            if let Some(part) = all.parts.iter_mut().find(|p| p.id == child) { part.parent = Some(pid); }
+            if let Some(part) = all.parts.iter_mut().find(|p| p.id == child) { part.parent = Some(pid.clone()); }
+            // The child's root flare must not poke out through the far side of
+            // the parent: outline points around the root that fall outside
+            // the parent (and are not already heading up the child) are drawn
+            // back into it, where the join hides them.
+            if let (Some(join), Some(par)) = (self.attach_point(i), all.parts.iter().find(|p| p.id == pid).map(|p| p.polygon.clone())) {
+                if let Some(part) = all.parts.iter_mut().find(|p| p.id == child) { tuck_root(part, &par, join); }
+            }
+            // collar leafage over the fork, drawn on top of everything grown so far
+            let s = self.growth_for(i);
+            if let Some(size) = s.collar.filter(|v| v.is_finite() && *v > 0.0) {
+                let style = s.collar_style.as_deref().and_then(crate::collar::CollarStyle::from_id).unwrap_or(crate::collar::CollarStyle::Axil);
+                let join = self.attach_point(i);
+                let (par, ch) = (all.parts.iter().find(|p| p.id == pid), all.parts.iter().find(|p| p.id == child));
+                if let (Some(join), Some(par), Some(ch)) = (join, par, ch) {
+                    let leaves = crate::collar::collar_parts(style, &format!("backbone-{i}/collar"), par, ch, join, size);
+                    all.parts.extend(leaves);
+                }
+            }
         }
         all
     }

@@ -24,9 +24,14 @@ pub struct GrowthSettings {
     pub wraps: Option<u8>,
     /// Library leaf (preset id) used for the wrapping leaves; None grows the plain acanthus wrap.
     pub wrap_leaf: Option<String>,
+    /// A sheathing collar over the join, for a backbone grown from another:
+    /// its size against the stems (1 = default); None is no collar.
+    pub collar: Option<f64>,
+    /// Collar style id ("axil" or "split"); None is the axil leaf.
+    pub collar_style: Option<String>,
 }
 impl Default for GrowthSettings {
-    fn default() -> Self { GrowthSettings { seed: 1248, branches: 5.0, reach: 33.0, curl: 1.0, levels: 2, leaves: 2, clearance: 2.0, stem: 2.8, side: Side::Alternate, family: None, composition: None, secondary_scale: None, sweeps: None, auto_shoots: None, flip: None, free: None, attach: None, wraps: None, wrap_leaf: None } }
+    fn default() -> Self { GrowthSettings { seed: 1248, branches: 5.0, reach: 33.0, curl: 1.0, levels: 2, leaves: 2, clearance: 2.0, stem: 2.8, side: Side::Alternate, family: None, composition: None, secondary_scale: None, sweeps: None, auto_shoots: None, flip: None, free: None, attach: None, wraps: None, wrap_leaf: None, collar: None, collar_style: None } }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

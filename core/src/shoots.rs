@@ -15,9 +15,11 @@ pub struct ShootParams {
     pub depth: Option<f64>, pub stalk: Option<f64>, pub taper: Option<f64>, pub bend: Option<f64>, pub preset: Option<String>,
     /// Library leaves: how much the leaf bends with the stem it grows from (0 to 1).
     pub follow: Option<f64>,
+    /// Leaf fan: this leaf plus smaller companions (66%, 33%) from the same node (2 or 3 leaves).
+    pub fan: Option<u8>,
 }
 impl Default for ShootParams {
-    fn default() -> Self { ShootParams { progress: 0.5, reach: 0.12, turn: 0.0, curl: 0.66, side: 1.0, leaf_side: None, stem: None, leaf_scale: None, lobes: None, depth: None, stalk: None, taper: None, bend: None, preset: None, follow: None } }
+    fn default() -> Self { ShootParams { progress: 0.5, reach: 0.12, turn: 0.0, curl: 0.66, side: 1.0, leaf_side: None, stem: None, leaf_scale: None, lobes: None, depth: None, stalk: None, taper: None, bend: None, preset: None, follow: None, fan: None } }
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct ShootEdit { pub params: ShootParams, pub id: String, pub backbone: usize, pub replaces: Option<String>, pub hidden: bool, pub under: bool }
@@ -126,6 +128,19 @@ fn grow_measured(guide: &[Point], parent: &GrowthPart, e: &ShootParams, id: &str
     GrowthPart { id: id.into(), parent: Some(parent.id.clone()), kind: Kind::Secondary, points: spine, polygon, folds, ridges: Some(ridges), cuts: vec![], contour_split: None, width: 3.0, length: s_len, birth: 0.35, duration: 0.25, shoot: Some(e.clone()), under: false }
 }
 
+/// The companions of a leaf fan: smaller copies of the lead leaf growing from
+/// the same node, each swung further away from the stem (splaying outward)
+/// and tucked behind the lead, so the fan reads 100 / 66 / 33.
+pub fn fan_members(lead: &ShootParams) -> Vec<ShootParams> {
+    let n = lead.fan.unwrap_or(1).clamp(1, 3) as usize;
+    (1..n).map(|k| {
+        let scale = [1.0, 0.66, 0.33][k];
+        let swing = -FAN_SWING * k as f64 * lead.side;
+        ShootParams { reach: lead.reach * scale, turn: lead.turn - swing, fan: None, ..lead.clone() }
+    }).collect()
+}
+pub const FAN_SWING: f64 = 0.42;
+
 /// Apply one backbone's edits: replaced shoots drop out, tucked leaves go
 /// beneath the main sweep, everything else is drawn above it.
 pub fn apply_shoot_edits(result: GrowthResult, guide: &[Point], edits: &[ShootEdit], leaves: bool) -> GrowthResult {
@@ -133,7 +148,14 @@ pub fn apply_shoot_edits(result: GrowthResult, guide: &[Point], edits: &[ShootEd
     let Some(main) = result.parts.iter().find(|p| p.parent.is_none()).cloned() else { return result; };
     let replaced: Vec<&str> = edits.iter().filter_map(|e| e.replaces.as_deref()).collect();
     let kept: Vec<GrowthPart> = result.parts.into_iter().filter(|p| !replaced.contains(&p.id.as_str())).collect();
-    let grown: Vec<(bool, GrowthPart)> = edits.iter().filter(|e| !e.hidden).map(|e| { let mut part = grow_shoot(guide, &main, &e.params, &e.id, leaves); part.under = e.under; (e.under, part) }).collect();
+    let grown: Vec<(bool, GrowthPart)> = edits.iter().filter(|e| !e.hidden).flat_map(|e| {
+        let mut part = grow_shoot(guide, &main, &e.params, &e.id, leaves); part.under = e.under;
+        // fan companions sit behind the lead (smallest furthest back) and are
+        // edited through the lead leaf, so they carry no shoot of their own
+
+        let members = fan_members(&e.params).into_iter().enumerate().map(|(k, p)| { let mut m = grow_shoot(guide, &main, &p, &format!("{}~fan{}", e.id, k + 1), leaves); m.shoot = None; m.under = e.under; (e.under, m) }).collect::<Vec<_>>();
+        members.into_iter().rev().chain(std::iter::once((e.under, part))).collect::<Vec<_>>()
+    }).collect();
     let mut parts: Vec<GrowthPart> = grown.iter().filter(|g| g.0).map(|g| g.1.clone()).collect();
     parts.extend(kept);
     parts.extend(grown.into_iter().filter(|g| !g.0).map(|g| g.1));

@@ -6,10 +6,11 @@ A desktop carving design tool for Windows, written in Rust. Generate acanthus sc
 
 - **Scroll workspace:** grown sweeps and acanthus leaves on editable backbones, with Select (V), Pen (P) and Move/Transform (T) tools.
   - **Construction picker:** single scroll, parent and child, S-scroll, mirrored pair, running border, point of origin and corner, each with seeded variations.
-  - **Backbones grown from other backbones:** they join like a leaf root and move with their parent.
+  - **Backbones grown from other backbones:** they join like a leaf root and move with their parent. The fork can be dressed with a collar: an axil leaf lying over the crotch, or a split sheath opening along both stems.
   - **Library:** measured leaf types, terminal buds (husk, trefoil, berry cluster) and saved presets.
   - **Wrapping leaves** laid into a scroll's curl, either generated or taken from the library.
   - **Follow stem**, which bends a placed leaf along the stem it grows from.
+  - **Leaf fans:** two or three leaves from one node, sized 100 / 66 / 33.
   - **Layers and carving guides:** over/under layering and carving guides.
 - **Chip workspace:** a chip-carving pattern generator with its own preset library.
 - **Themes:** Graphite (default), Midnight, Slate, Studio, Paper and Sage.

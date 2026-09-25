@@ -86,8 +86,13 @@ pub fn spiral_anatomy(page: &Page, s: &GrowthSettings) -> GrowthResult {
         // A backbone growing from another stem starts narrow and flares out
         // of it like a leaf root, instead of starting blunt.
         let attached = is_main && s.attach.is_some();
-        let root_width = if attached { 2f64.min(width * 0.45) * 0.9 } else if is_main { 0.0 } else { root_flare(&parts[0].polygon, points[0], leaf_width) };
-        let o = ContourOptions { start: if is_main { guide_length / length * GOLDEN_SMALL } else { 0.0 }, belly: if is_main { GOLDEN_SMALL } else { 0.0 }, lobed: s.leaves > 0, root_width, stalk: if is_main { 0.0 } else { shoot_stalk() }, ends: if attached { Some(Ends { start: 0.2, tip: MAIN_ENDS.tip }) } else if is_main { Some(MAIN_ENDS) } else { None }, ..ContourOptions::default() };
+        // With a collar the root sits under the collar leaves, so it flares to
+        // fill the mouth between them. Either way the stem keeps real width
+        // past the flare (a start of 0.2 pinched it into a thin neck).
+        let collar = attached.then_some(s.collar).flatten().filter(|c| c.is_finite() && *c > 0.0);
+        let root_width = match (attached, collar) { (true, Some(c)) => 2.6 * c.clamp(0.6, 1.6), (true, None) => 2f64.min(width * 0.45) * 0.9, _ if is_main => 0.0, _ => root_flare(&parts[0].polygon, points[0], leaf_width) };
+        let attached_start = if collar.is_some() { MAIN_ENDS.start } else { 0.9 };
+        let o = ContourOptions { start: if is_main { guide_length / length * GOLDEN_SMALL } else { 0.0 }, belly: if is_main { GOLDEN_SMALL } else { 0.0 }, lobed: s.leaves > 0, root_width, stalk: if is_main { 0.0 } else { shoot_stalk() }, ends: if attached { Some(Ends { start: attached_start, tip: MAIN_ENDS.tip }) } else if is_main { Some(MAIN_ENDS) } else { None }, ..ContourOptions::default() };
         let a = acanthus_contour(&points, 2f64.min(width * 0.45), side, leaf_width, &o);
         let p = &mut parts[idx];
         p.polygon = a.polygon; p.folds = a.folds; p.ridges = Some(a.ridges); p.contour_split = Some(241);

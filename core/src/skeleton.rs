@@ -170,7 +170,11 @@ pub fn skeleton_layout(kind: Skeleton, seed: u32, width: f64, height: f64) -> La
     l.growth = stems.iter().enumerate().map(|(i, s)| GrowthSettings {
         seed: seed.wrapping_add(i as u32 * 7919), family: Some(s.family), side: s.curl, levels: if s.accents >= 2 { 2 } else { 1 },
         auto_shoots: Some(s.accents > 0), secondary_scale: Some(s.scale.clamp(0.5, 2.0)), flip: if s.flip { Some(true) } else { None },
-        free: Some(true), attach: s.attach, ..GrowthSettings::default() }).collect();
+        free: Some(true), attach: s.attach,
+        // collars dress each fork; left bare where a bud already sits on the join
+        // (corner, mirrored pair) and on the fan, whose roots are too close together
+        collar: if s.attach.is_some() && !matches!(kind, Skeleton::Corner | Skeleton::MirroredPair | Skeleton::Fan) { Some(1.0) } else { None },
+        ..GrowthSettings::default() }).collect();
     // Buds: heading given absolutely, turned relative to the stem there.
     for (k, b) in buds.iter().enumerate() {
         let pts: Vec<Point> = arc_table(&l.curves[b.backbone]).into_iter().map(|r| r.point).collect();

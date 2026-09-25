@@ -12,6 +12,7 @@ use scroll_core::geometry::{fit_curve, pt, Bounds, Curve, Point};
 use scroll_core::growth::{Family, GrowthPart, GrowthResult, GrowthSettings, Side};
 use scroll_core::layers::{carving_guides, layered_drawing, Drawing, Guides};
 use scroll_core::bud::{is_bud, BUD_PRESETS};
+use scroll_core::collar::CollarStyle;
 use scroll_core::model::{convert_legacy, preset_params, Layout, LEAF_PRESETS};
 use scroll_core::skeleton::{skeleton_layout, Skeleton};
 use scroll_core::outline::inside;
@@ -461,6 +462,22 @@ impl App {
                 ui.label(format!("Grows from backbone {}", parent + 1));
                 if ui.button("Detach").on_hover_text("Stop growing from that stem; the scroll stays where it is").clicked() { let mut g = self.settings(); g.attach = None; self.set_settings(g); }
             });
+            let g = self.settings();
+            ui.horizontal(|ui| {
+                let mut on = g.collar.is_some();
+                let toggled = ui.checkbox(&mut on, "Collar at the fork").on_hover_text("Leafage dressing the join, as in baroque acanthus, where a branch rarely leaves its stem bare: an axil leaf lying over the fork, or a split sheath opening along both stems.").changed();
+                let mut size = g.collar.unwrap_or(1.0) * 100.0;
+                let resized = on && ui.add(egui::Slider::new(&mut size, 60.0..=180.0).text("%").fixed_decimals(0)).changed();
+                if toggled || resized { let mut g = g.clone(); g.collar = if on { Some(size / 100.0) } else { None }; self.set_settings(g); }
+            });
+            if g.collar.is_some() {
+                ui.horizontal(|ui| {
+                    let now = g.collar_style.as_deref().and_then(CollarStyle::from_id).unwrap_or(CollarStyle::Axil);
+                    let mut pick = now;
+                    for st in CollarStyle::ALL { ui.selectable_value(&mut pick, st, st.name()); }
+                    if pick != now { let mut g = g.clone(); g.collar_style = Some(pick.id().into()); self.set_settings(g); }
+                });
+            }
         }
         let mut g = self.settings(); let before = g.clone();
         ui.add_space(6.0);
@@ -595,6 +612,14 @@ impl App {
         } else {
             let mut curl = sh.curl; if ui.add(egui::Slider::new(&mut curl, 0.2..=1.2).text("Curl")).changed() { self.patch_shoot(|e| e.params.curl = curl); }
         }
+        if !bud {
+            ui.horizontal(|ui| {
+                ui.label("Leaf fan").on_hover_text("Grow smaller copies of this leaf from the same node, sized 100 / 66 / 33, splaying away from the stem behind it.");
+                let now = sh.fan.unwrap_or(1).clamp(1, 3); let mut n = now;
+                for (v, name) in [(1u8, "Single"), (2, "Two"), (3, "Three")] { ui.selectable_value(&mut n, v, name); }
+                if n != now { self.patch_shoot(|e| e.params.fan = if n > 1 { Some(n) } else { None }); }
+            });
+        }
         let lean = measured.map_or(0.0, |p| sh.side * p.frame);
         let mut angle = (sh.turn - lean).to_degrees();
         if ui.add(egui::Slider::new(&mut angle, -180.0..=180.0).text("Angle °").fixed_decimals(0)).changed() { self.patch_shoot(|e| e.params.turn = angle.to_radians() + lean); }
@@ -642,7 +667,7 @@ impl App {
         section(ui, self.t(), "Layers");
         ui.label(egui::RichText::new("Top of the list is drawn on top.").small().color(self.t().dim));
         let parts: Vec<(String, String, bool)> = self.grown.parts.iter().rev().map(|p| {
-            let name = if p.parent.is_none() { "Main sweep".to_string() } else if p.id.rsplit('/').next().is_some_and(|s| s.starts_with("wrap-")) { "Wrapping leaf".to_string() } else if let Some(n) = p.shoot.as_ref().and_then(|s| s.preset.as_deref()).and_then(|id| LEAF_PRESETS.iter().find(|q| q.id == id).map(|q| q.name).or_else(|| BUD_PRESETS.iter().find(|q| q.id == id).map(|q| q.name))) { n.to_string() } else { "Acanthus shoot".to_string() };
+            let name = if p.parent.is_none() { "Main sweep".to_string() } else if p.id.rsplit('/').next().is_some_and(|s| s.starts_with("wrap-")) { "Wrapping leaf".to_string() } else if p.id.contains("~fan") { "Fan leaf (select the lead leaf)".to_string() } else if p.id.rsplit('/').next().is_some_and(|s| s.starts_with("collar")) { "Collar leaf".to_string() } else if let Some(n) = p.shoot.as_ref().and_then(|s| s.preset.as_deref()).and_then(|id| LEAF_PRESETS.iter().find(|q| q.id == id).map(|q| q.name).or_else(|| BUD_PRESETS.iter().find(|q| q.id == id).map(|q| q.name))) { n.to_string() } else { "Acanthus shoot".to_string() };
             let (b, _) = self.split_id(&p.id);
             (p.id.clone(), if self.multi() { format!("{name} · backbone {}", b + 1) } else { name }, p.parent.is_some() && p.shoot.is_some())
         }).collect();
@@ -845,7 +870,7 @@ impl App {
                         self.grown.parts.iter().any(|p| p.parent.is_none() && (!self.multi() || p.id.starts_with(&pre)) && inside(points[0], &p.polygon)) });
                     let mut next = self.layout.clone();
                     let mut g = next.growth_for(self.backbone); next.growth.resize(next.curves.len(), g.clone());
-                    g.attach = host; g.free = Some(true); if host.is_some() { g.levels = 1; }
+                    g.attach = host; g.free = Some(true); if host.is_some() { g.levels = 1; g.collar = Some(1.0); }
                     next.curves.push(c); next.growth.push(g);
                     self.commit(next);
                     self.backbone = self.layout.curves.len() - 1; self.tool = Tool::Select;
@@ -891,7 +916,8 @@ impl App {
         None
     }
     fn hit_leaf(&self, mm: Point) -> Option<String> {
-        self.grown.parts.iter().rev().find(|p| p.parent.is_some() && p.shoot.is_some() && inside(mm, &p.polygon)).map(|p| p.id.clone())
+        // a fan's smaller leaves select the lead leaf that carries the fan
+        self.grown.parts.iter().rev().find(|p| p.parent.is_some() && (p.shoot.is_some() || p.id.contains("~fan")) && inside(mm, &p.polygon)).map(|p| p.id.split("~fan").next().unwrap_or(&p.id).to_string())
     }
     fn paint_grid(&self, painter: &egui::Painter, paper: Rect) {
         let grid = self.canvas_colors().grid;

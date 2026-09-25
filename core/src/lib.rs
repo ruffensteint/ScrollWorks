@@ -15,3 +15,4 @@ pub mod chip;
 pub mod bud;
 pub mod skeleton;
 pub mod wraps;
+pub mod collar;
